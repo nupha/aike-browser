@@ -43,12 +43,51 @@ pub(crate) fn register_spawned_child(handle: &Arc<tokio::sync::Mutex<Option<Chil
     reg.lock().unwrap().push(handle.clone());
 }
 
+/// Terminate a spawned browser child and **reap** it: `start_kill()` only
+/// requests termination (on Windows `TerminateProcess`), and a process that is
+/// never waited on stays a zombie holding its profile dir open.
+///
+/// `timeout` bounds the wait so a wedged child cannot hang the caller; on
+/// timeout the reaper is detached and the `kill_on_drop` backstop still applies.
+pub(crate) async fn kill_and_reap(child: &mut Child, timeout: Duration) {
+    let _ = child.start_kill();
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(_) => {}
+        Err(_) => {
+            // Still alive after `timeout`: hand it to the global spawn registry
+            // so runtime-exit cleanup reaps it, and drop the backstop's grip by
+            // leaving the caller to hold it (kill_on_drop still applies).
+            log::warn!("browser process did not exit within {timeout:?}");
+        }
+    }
+}
+
+/// Best-effort recursive removal of an auto-created `aike-chrome-*` profile
+/// dir. Chrome holds locks until it is fully reaped, so callers do this *after*
+/// [`kill_and_reap`]; a dir that is still locked is left for the next run.
+fn remove_profile_dir(dir: &std::path::Path) {
+    if !dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("aike-chrome-"))
+    {
+        return; // never delete anything we did not create
+    }
+    if let Err(e) = std::fs::remove_dir_all(dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::debug!("could not remove chrome profile dir {}: {e}", dir.display());
+    }
+}
+
 /// A spawned browser CDP server: resolved binary, process handle, and the
 /// ready browser-level CDP WebSocket URL.
 pub(crate) struct SpawnedBrowser {
     pub(crate) bin: String,
     pub(crate) child: Child,
     pub(crate) cdp_url: String,
+    /// Auto-created profile dir, removed after the child is reaped.
+    pub(crate) user_data_dir: Option<std::path::PathBuf>,
 }
 
 /// Spawn a browser CDP server process and wait until its endpoint is ready.
@@ -67,6 +106,9 @@ pub(crate) async fn spawn(
     kill_on_drop: bool,
 ) -> Result<SpawnedBrowser, String> {
     let user_data_dir = auto_data_dir(port);
+    // Only auto mode (no explicit `args`) creates this dir; a custom command
+    // line owns wherever it points, so it must never be deleted by us.
+    let owns_data_dir = args.is_none();
     let (bin, args) = match (bin, args) {
         (Some(bin), Some(args)) => {
             if port == 0 {
@@ -99,16 +141,29 @@ pub(crate) async fn spawn(
 
     // Auto port: discover the real endpoint from DevToolsActivePort; explicit
     // port: poll the known /json/version endpoint.
-    let cdp_url = if port == 0 {
-        wait_for_devtools_port(&user_data_dir).await?
+    let mut child = child;
+    let cdp_url = match if port == 0 {
+        wait_for_devtools_port(&user_data_dir, &mut child).await
     } else {
-        wait_for_debug_url(port).await?
+        wait_for_debug_url(port, &mut child).await
+    } {
+        Ok(url) => url,
+        Err(e) => {
+            // No caller received a handle, so the process and its profile dir
+            // are ours to clean up here — otherwise they are simply orphaned.
+            kill_and_reap(&mut child, Duration::from_secs(10)).await;
+            if owns_data_dir {
+                remove_profile_dir(&user_data_dir);
+            }
+            return Err(e);
+        }
     };
 
     Ok(SpawnedBrowser {
         bin,
         child,
         cdp_url,
+        user_data_dir: owns_data_dir.then_some(user_data_dir),
     })
 }
 
@@ -119,9 +174,22 @@ pub(crate) async fn launch(
     port: u16,
     proxy_url: Option<&str>,
     chrome_path: Option<&str>,
-) -> Result<(Child, String), String> {
+) -> Result<(Child, String, Option<std::path::PathBuf>), String> {
     let spawned = spawn(chrome_path, None, headless, port, proxy_url, true).await?;
-    Ok((spawned.child, spawned.cdp_url))
+    Ok((spawned.child, spawned.cdp_url, spawned.user_data_dir))
+}
+
+/// [`kill_and_reap`] plus profile-dir cleanup, for an explicit `close()`.
+///
+/// The dir can only be removed once the process is fully reaped (Chrome keeps
+/// its locks until then), so the removal runs after the wait.
+pub(crate) async fn shutdown_and_cleanup(
+    child: &mut Child,
+    user_data_dir: &std::path::Path,
+    timeout: Duration,
+) {
+    kill_and_reap(child, timeout).await;
+    remove_profile_dir(user_data_dir);
 }
 
 /// Unique per-launch user-data-dir (pid + seq); explicit-port launches keep
@@ -195,42 +263,108 @@ fn chrome_args(
 /// Poll `<user-data-dir>/DevToolsActivePort` (written by Chrome once the debug
 /// server binds) and build the browser WS url from it: line 1 is the port,
 /// line 2 is the browser target path.
-async fn wait_for_devtools_port(user_data_dir: &std::path::Path) -> Result<String, String> {
+///
+/// The file is written slightly *before* the HTTP listener accepts connections,
+/// and a Chrome that aborts during startup may leave the file behind while
+/// never listening at all. So the port is probed before returning, and a child
+/// that has already exited fails fast with its exit status instead of being
+/// retried until the timeout.
+async fn wait_for_devtools_port(
+    user_data_dir: &std::path::Path,
+    child: &mut Child,
+) -> Result<String, String> {
     let file = user_data_dir.join("DevToolsActivePort");
     for _ in 0..300 {
         if let Ok(content) = std::fs::read_to_string(&file) {
             let mut lines = content.lines();
             if let (Some(port), Some(path)) = (lines.next(), lines.next())
                 && let Ok(port) = port.trim().parse::<u16>()
+                && port_is_listening(port).await
             {
                 return Ok(format!("ws://127.0.0.1:{}{}", port, path.trim()));
             }
+        }
+
+        // A browser that exited cannot ever publish an endpoint: report why
+        // rather than burning the whole timeout on a dead process.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "browser exited during startup ({status}) before its CDP endpoint became reachable"
+            ));
         }
         sleep(Duration::from_millis(100)).await;
     }
     Err("Chrome did not write DevToolsActivePort within 30 seconds".into())
 }
 
+/// True once `127.0.0.1:port` accepts a TCP connection, i.e. Chrome's DevTools
+/// HTTP listener is actually up (the port file alone does not prove that).
+async fn port_is_listening(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 /// Poll Chrome's /json/version until webSocketDebuggerUrl appears.
-async fn wait_for_debug_url(port: u16) -> Result<String, String> {
+///
+/// A refused connection here is expected while the listener finishes binding,
+/// so only "nothing listening yet" errors are retried; anything else (bad
+/// response, malformed JSON) fails immediately with its cause.
+async fn wait_for_debug_url(port: u16, child: &mut Child) -> Result<String, String> {
     let url = format!("http://127.0.0.1:{}/json/version", port);
     let client = reqwest::Client::new();
+    let mut last_err = String::new();
 
     for _ in 0..60 {
-        if let Ok(resp) = client
+        match client
             .get(&url)
             .timeout(Duration::from_secs(1))
             .send()
             .await
-            && let Ok(json) = resp.json::<serde_json::Value>().await
-            && let Some(ws_url) = json.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
         {
-            return Ok(ws_url.to_string());
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    if let Some(ws_url) = json.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
+                    {
+                        return Ok(ws_url.to_string());
+                    }
+                    last_err = format!("no webSocketDebuggerUrl in response from {url}");
+                }
+                Err(e) => last_err = format!("invalid /json/version response from {url}: {e}"),
+            },
+            // Not listening yet: keep polling.
+            Err(e) if is_connection_refused(&e.to_string()) => {}
+            Err(e) => last_err = format!("failed to query CDP endpoint {url}: {e}"),
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "browser exited during startup ({status}) before its CDP endpoint became reachable"
+            ));
         }
         sleep(Duration::from_millis(500)).await;
     }
 
-    Err("Chrome did not start within 30 seconds".into())
+    if last_err.is_empty() {
+        Err("Chrome did not start within 30 seconds".into())
+    } else {
+        Err(last_err)
+    }
+}
+
+/// True when an error means "nothing is listening on that port yet", which is
+/// transient while a browser starts. Mirrors the check in `cdp`; kept separate
+/// so this module does not depend on the CDP client's internals.
+fn is_connection_refused(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("connection refused")
+        || m.contains("actively refused")
+        || m.contains("os error 10061")
+        || m.contains("os error 111")
 }
 
 /// Find Chrome/Chromium executable path.

@@ -8,20 +8,28 @@
 
 use std::sync::Arc;
 
-use zuqe_zapi::*;
 use zuqe_zapi::ffi::{ZQ_PROP_CONFIGURABLE, ZQ_PROP_ENUMERABLE, ZQ_PROP_WRITABLE};
+use zuqe_zapi::*;
 use zuqe_zapi_macros::{zq_class, zq_class_impl, zq_method, zq_static_method};
 
 use crate::{
     cdp, chrome,
-    class_page::{JSPage, PageNetworkState, PagePayload, get_bool_prop, get_number_prop, get_str_prop},
+    class_page::{
+        JSPage, PageNetworkState, PagePayload, get_bool_prop, get_number_prop, get_str_prop,
+    },
     helpers,
 };
+
+/// How long `close()` / a failed launch waits for Chrome to actually exit
+/// before giving up on reaping it.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Payload attached to every `Browser` instance.
 pub(crate) struct BrowserPayload {
     pub(crate) client: cdp::CdpClient,
     pub(crate) chrome_child: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
+    /// Auto-created Chrome profile dir, removed once the child is reaped.
+    pub(crate) user_data_dir: Option<std::path::PathBuf>,
 }
 
 // No GC-managed JS values in the payload.
@@ -43,7 +51,9 @@ impl JSBrowser {
     #[zq_static_method]
     fn launch<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let mut req = LaunchRequest::default();
-        if cc.len() > 0 && let Some(opts) = cc.arg(0).as_object() {
+        if !cc.is_empty()
+            && let Some(opts) = cc.arg(0).as_object()
+        {
             req.proxy_url = get_str_prop(cx, &opts, "proxyUrl");
             req.chrome_path = get_str_prop(cx, &opts, "chromePath");
             req.cdp_url = get_str_prop(cx, &opts, "cdpUrl");
@@ -82,7 +92,9 @@ impl JSBrowser {
         let mut port = 0u16;
         let mut proxy_url: Option<String> = None;
 
-        if cc.len() > 0 && let Some(opts) = cc.arg(0).as_object() {
+        if !cc.is_empty()
+            && let Some(opts) = cc.arg(0).as_object()
+        {
             bin = get_str_prop(cx, &opts, "bin");
             proxy_url = get_str_prop(cx, &opts, "proxyUrl");
             if let Some(v) = get_number_prop(cx, &opts, "port") {
@@ -107,7 +119,8 @@ impl JSBrowser {
             return Err(cx.throw_type("`spawn`: `args` requires `bin`"));
         }
 
-        helpers::spawn_result(cx, 
+        helpers::spawn_result(
+            cx,
             async move {
                 let s = chrome::spawn(
                     bin.as_deref(),
@@ -120,15 +133,16 @@ impl JSBrowser {
                 .await?;
                 let handle: ChildArcSlot = Arc::new(tokio::sync::Mutex::new(Some(s.child)));
                 chrome::register_spawned_child(&handle);
-                Ok((s.bin, s.cdp_url, handle))
+                Ok((s.bin, s.cdp_url, handle, s.user_data_dir))
             },
-            |cx, (bin, cdp_url, child)| {
+            |cx, (bin, cdp_url, child, user_data_dir)| {
                 JSBrowserProcess::new_instance(
                     cx,
                     BrowserProcessPayload {
                         child,
                         bin,
                         cdp_url,
+                        user_data_dir,
                     },
                 )
             },
@@ -145,7 +159,7 @@ impl JSBrowser {
 
         let mut url = "about:blank".to_string();
         let mut context_id: Option<String> = None;
-        if cc.len() > 0 {
+        if !cc.is_empty() {
             if let Some(s) = cc.arg(0).try_string_read_utf8(cx) {
                 url = s;
             } else if let Some(obj) = cc.arg(0).as_object() {
@@ -157,7 +171,8 @@ impl JSBrowser {
         }
 
         let client_cb = client.clone();
-        helpers::spawn_result(cx, 
+        helpers::spawn_result(
+            cx,
             async move {
                 let mut params = serde_json::json!({ "url": url });
                 if let Some(cid) = context_id {
@@ -218,7 +233,9 @@ impl JSBrowser {
         let payload = get_browser_payload(cx, cc.this())?;
         let client = payload.client.clone();
         let chrome_child = payload.chrome_child.clone();
-        helpers::spawn_result(cx, 
+        let user_data_dir = payload.user_data_dir.clone();
+        helpers::spawn_result(
+            cx,
             async move {
                 // Attach mode (no child process): don't send `Browser.close`.
                 let owns_process = chrome_child
@@ -228,11 +245,19 @@ impl JSBrowser {
                 if owns_process {
                     let _ = client.send("Browser.close", None, None).await;
                 }
-                if let Ok(mut guard) = chrome_child.try_lock() {
-                    if let Some(child) = guard.as_mut() {
-                        let _ = child.start_kill();
+                if let Ok(mut guard) = chrome_child.try_lock()
+                    && let Some(mut child) = guard.take()
+                {
+                    // On Windows, `Browser.close` and child.start_kill() are
+                    // asynchronous; wait for actual exit before removing the
+                    // user-data-dir, otherwise Chrome would rewrite files in
+                    // a directory we are deleting.
+                    match user_data_dir {
+                        Some(dir) => {
+                            chrome::shutdown_and_cleanup(&mut child, &dir, CLOSE_TIMEOUT).await;
+                        }
+                        None => chrome::kill_and_reap(&mut child, CLOSE_TIMEOUT).await,
                     }
-                    *guard = None;
                 }
                 Ok(())
             },
@@ -256,7 +281,8 @@ impl JSBrowser {
     #[zq_method(name = "getVersion")]
     fn get_version<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let client = get_browser_payload(cx, cc.this())?.client.clone();
-        helpers::spawn_result(cx, 
+        helpers::spawn_result(
+            cx,
             async move {
                 client
                     .send("Browser.getVersion", None, None)
@@ -271,7 +297,8 @@ impl JSBrowser {
     #[zq_method(name = "getWindowBounds")]
     fn get_window_bounds<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let client = get_browser_payload(cx, cc.this())?.client.clone();
-        helpers::spawn_result(cx, 
+        helpers::spawn_result(
+            cx,
             async move {
                 let wid = browser_window_id(&client).await?;
                 client
@@ -291,7 +318,9 @@ impl JSBrowser {
     #[zq_method(name = "setWindowBounds")]
     fn set_window_bounds<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let mut bounds = serde_json::Map::new();
-        if cc.len() > 0 && let Some(obj) = cc.arg(0).as_object() {
+        if !cc.is_empty()
+            && let Some(obj) = cc.arg(0).as_object()
+        {
             if let Some(v) = get_number_prop(cx, &obj, "left") {
                 bounds.insert("left".into(), serde_json::Value::from(v as i32));
             }
@@ -310,7 +339,8 @@ impl JSBrowser {
         }
 
         let client = get_browser_payload(cx, cc.this())?.client.clone();
-        helpers::spawn_result(cx, 
+        helpers::spawn_result(
+            cx,
             async move {
                 let wid = browser_window_id(&client).await?;
                 client
@@ -419,31 +449,50 @@ fn browser_promise<'a>(cx: ZqCtx<'a>, req: LaunchRequest) -> Result<ZqValue<'a>,
         cdp_url,
     } = req;
 
-    helpers::spawn_result(cx, 
+    helpers::spawn_result(
+        cx,
         async move {
             if let Some(url) = cdp_url {
-                cdp::CdpClient::connect(&url).await.map(|(c, _)| (c, None))
+                cdp::CdpClient::connect(&url)
+                    .await
+                    .map(|(c, _)| (c, None, None))
             } else {
                 match chrome::launch(headless, port, proxy_url.as_deref(), chrome_path.as_deref())
                     .await
                 {
-                    Ok((mut child, ws_url)) => match cdp::CdpClient::connect(&ws_url).await {
-                        Ok((c, _)) => Ok((c, Some(child))),
-                        Err(e) => {
-                            let _ = child.start_kill();
-                            Err(e)
+                    Ok((mut child, ws_url, data_dir)) => {
+                        match cdp::CdpClient::connect(&ws_url).await {
+                            Ok((c, _)) => Ok((c, Some(child), data_dir)),
+                            Err(e) => {
+                                // Never leave the browser we just started behind:
+                                // reap it (and drop its profile dir) before
+                                // reporting why the connection failed.
+                                match data_dir {
+                                    Some(dir) => {
+                                        chrome::shutdown_and_cleanup(
+                                            &mut child,
+                                            &dir,
+                                            CLOSE_TIMEOUT,
+                                        )
+                                        .await;
+                                    }
+                                    None => chrome::kill_and_reap(&mut child, CLOSE_TIMEOUT).await,
+                                }
+                                Err(e)
+                            }
                         }
-                    },
+                    }
                     Err(e) => Err(e),
                 }
             }
         },
-        |cx, (client, child)| {
+        |cx, (client, child, user_data_dir)| {
             JSBrowser::new_instance(
                 cx,
                 BrowserPayload {
                     client,
                     chrome_child: Arc::new(tokio::sync::Mutex::new(child)),
+                    user_data_dir,
                 },
             )
         },
@@ -464,6 +513,8 @@ pub(crate) struct BrowserProcessPayload {
     pub(crate) bin: String,
     /// Ready browser-level CDP WebSocket URL (surfaced via `cdpUrl`).
     pub(crate) cdp_url: String,
+    /// Auto-created Chrome profile dir, removed once the child is reaped.
+    pub(crate) user_data_dir: Option<std::path::PathBuf>,
 }
 
 #[zq_class(name = "BrowserProcess", payload = BrowserProcessPayload, payload_no_gc)]
@@ -472,24 +523,27 @@ pub struct JSBrowserProcess;
 #[zq_class_impl]
 impl JSBrowserProcess {
     fn constructor<'a>(cx: ZqCtx<'a>, _cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        Err(cx.throw_type(
-            "BrowserProcess cannot be constructed directly; use Browser.spawn()",
-        ))
+        Err(cx.throw_type("BrowserProcess cannot be constructed directly; use Browser.spawn()"))
     }
 
     /// `process.kill()` — kill the spawned browser process; resolves after exit.
     #[zq_method]
     fn kill<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let child = JSBrowserProcess::payload(cx, cc.this())
-            .ok_or_else(|| cx.throw_type("not a BrowserProcess instance"))?
-            .child
-            .clone();
-        helpers::spawn_result(cx, 
+        let payload = JSBrowserProcess::payload(cx, cc.this())
+            .ok_or_else(|| cx.throw_type("not a BrowserProcess instance"))?;
+        let child = payload.child.clone();
+        let user_data_dir = payload.user_data_dir.clone();
+        helpers::spawn_result(
+            cx,
             async move {
                 let mut guard = child.lock().await;
                 if let Some(mut child) = guard.take() {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    match user_data_dir {
+                        Some(dir) => {
+                            chrome::shutdown_and_cleanup(&mut child, &dir, CLOSE_TIMEOUT).await;
+                        }
+                        None => chrome::kill_and_reap(&mut child, CLOSE_TIMEOUT).await,
+                    }
                 }
                 Ok(())
             },
@@ -547,7 +601,8 @@ pub(crate) fn send_browser_void_cmd<'a>(
     params: Option<serde_json::Value>,
 ) -> Result<ZqValue<'a>, ZqError> {
     let client = get_browser_payload(cx, cc.this())?.client.clone();
-    helpers::spawn_result(cx, 
+    helpers::spawn_result(
+        cx,
         async move {
             client
                 .send(method, params, None)

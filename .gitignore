@@ -1,8 +1,16 @@
 *
-
 !src/
 !src/**
 !types/
 !types/**/
 !tests/
 !tests/**
+
+# Generated build outputs (rebuilt by `make build` / the fake_cdp_server rule):
+# the compiled zapi module, the stand-in CDP server binary built from its .rs,
+# and runtime state written by the tests.
+tests/browser.aike
+tests/fake_cdp_server.exe
+tests/fake_cdp_server.pdb
+tests/debug.log
+tests/localStorage.redb

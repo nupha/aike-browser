@@ -14,6 +14,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
@@ -50,15 +51,56 @@ pub(crate) struct CdpClient {
     event_tx: broadcast::Sender<CdpEvent>,
 }
 
+/// How long [`CdpClient::connect`] keeps retrying a *refused* WebSocket before
+/// giving up. The endpoint probe (`DevToolsActivePort` / `/json/version`) can
+/// observe the debug port slightly before the HTTP listener finishes binding,
+/// so a single attempt intermittently failed with WSAECONNREFUSED.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Delay between WebSocket connect attempts while the listener comes up.
+const WS_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// True for "nothing is listening yet" errors, which are the transient case
+/// worth retrying. Everything else (DNS, TLS, bad URL, refused upgrade) is
+/// reported immediately so a real failure keeps its cause.
+///
+/// `tungstenite` is not a direct dependency, so this matches the rendered error
+/// (its `Io` variant displays the underlying `std::io::Error`, e.g. "…
+/// (os error 10061)" on Windows / "Connection refused (os error 111)" on Unix).
+fn is_connect_refused_msg(err: &str) -> bool {
+    let msg = err.to_ascii_lowercase();
+    msg.contains("connection refused")
+        || msg.contains("actively refused")
+        || msg.contains("connection reset")
+        || msg.contains("os error 10061")
+        || msg.contains("os error 111")
+        || msg.contains("os error 104")
+}
+
 impl CdpClient {
     /// Connect to Chrome's DevTools WebSocket and spawn background reader/writer.
+    ///
+    /// Retries a refused connection until [`WS_CONNECT_TIMEOUT`]: the caller has
+    /// already observed the debug port, and on both Windows and Unix a refused
+    /// TCP/upgrade at this point means the listener is still binding, not that
+    /// the browser is unusable. Any other error fails immediately.
     pub(crate) async fn connect(
         ws_url: &str,
     ) -> Result<(Self, tokio::task::JoinHandle<()>), String> {
         let ws_url = Self::resolve_browser_url(ws_url).await?;
-        let (ws_stream, _) = connect_async(&ws_url)
-            .await
-            .map_err(|e| format!("CDP WebSocket connect failed: {e}"))?;
+
+        let deadline = std::time::Instant::now() + WS_CONNECT_TIMEOUT;
+        let (ws_stream, _) = loop {
+            match connect_async(&ws_url).await {
+                Ok(ok) => break ok,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if !is_connect_refused_msg(&msg) || std::time::Instant::now() >= deadline {
+                        return Err(format!("CDP WebSocket connect failed: {e}"));
+                    }
+                    tokio::time::sleep(WS_CONNECT_RETRY_DELAY).await;
+                }
+            }
+        };
         let (writer, reader) = ws_stream.split();
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
 
