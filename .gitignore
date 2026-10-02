@@ -1,14 +1,7 @@
 *
-
 !src/
 !src/**/*.rs
 !types/
 !types/**/*.d.ts
 !tests/
 !tests/**/*.mjs
-
-# Generated build outputs and runtime state (not checked in; rebuilt by
-# `make build` and written by the tests).
-tests/browser.aike
-tests/debug.log
-tests/localStorage.redb
