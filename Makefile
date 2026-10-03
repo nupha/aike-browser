@@ -1,8 +1,17 @@
 AIKE := ../aike/target/debug/aike
 
+# Rust names the cdylib differently per platform.
+ifeq ($(OS),Windows_NT)
+	LIB := target/debug/browser.dll
+else ifeq ($(shell uname -s),Darwin)
+	LIB := target/debug/libbrowser.dylib
+else
+	LIB := target/debug/libbrowser.so
+endif
+
 build:
 	mbx build
-	cp target/debug/browser.dll tests/browser.aike
+	cp $(LIB) tests/browser.aike
 
 test: build
 	$(AIKE) -m tests/import_zapi.mjs

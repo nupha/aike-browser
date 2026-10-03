@@ -62,10 +62,27 @@ pub(crate) async fn kill_and_reap(child: &mut Child, timeout: Duration) {
     }
 }
 
-/// Best-effort recursive removal of an auto-created `aike-chrome-*` profile
-/// dir. Chrome holds locks until it is fully reaped, so callers do this *after*
-/// [`kill_and_reap`]; a dir that is still locked is left for the next run.
-fn remove_profile_dir(dir: &std::path::Path) {
+/// Bounds for [`remove_profile_dir`]: how many removal rounds to spend, and how
+/// long a round waits before deciding the dir is really gone.
+const REMOVE_ROUNDS: u32 = 3;
+const REMOVE_QUIET: Duration = Duration::from_millis(300);
+
+/// Best-effort recursive removal of an auto-created `aike-chrome-*` profile dir.
+///
+/// Two timing effects make one `remove_dir_all` after [`kill_and_reap`] too few:
+/// Chrome holds locks until it is fully reaped, so the removal must follow the
+/// wait; and Chrome's helper processes outlive the browser process by a few
+/// hundred ms — long enough to recreate the user-data-dir we just deleted, which
+/// then stays behind as an empty dir. Nothing revisits it afterwards, because
+/// every launch gets a fresh `aike-chrome-<pid>-<seq>` name, so the leftovers
+/// accumulate without bound.
+///
+/// Hence "stay gone" rather than "remove once": each round removes, waits out
+/// [`REMOVE_QUIET`], and only returns once a re-check finds nothing. Bounded by
+/// [`REMOVE_ROUNDS`], and identical on every platform — Windows loses the final
+/// `rmdir` to a locked file, macOS and Linux to the helper tail, and polling
+/// settles all three.
+async fn remove_profile_dir(dir: &std::path::Path) {
     if !dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -73,11 +90,25 @@ fn remove_profile_dir(dir: &std::path::Path) {
     {
         return; // never delete anything we did not create
     }
-    if let Err(e) = std::fs::remove_dir_all(dir)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        log::debug!("could not remove chrome profile dir {}: {e}", dir.display());
+    for round in 1..=REMOVE_ROUNDS {
+        if let Err(e) = std::fs::remove_dir_all(dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::debug!("could not remove chrome profile dir {}: {e}", dir.display());
+        }
+        sleep(REMOVE_QUIET).await;
+        if !dir.exists() {
+            return;
+        }
+        log::debug!(
+            "chrome profile dir {} came back after removal (round {round}/{REMOVE_ROUNDS})",
+            dir.display()
+        );
     }
+    log::warn!(
+        "chrome profile dir {} survived {REMOVE_ROUNDS} removal rounds",
+        dir.display()
+    );
 }
 
 /// A spawned browser CDP server: resolved binary, process handle, and the
@@ -153,7 +184,7 @@ pub(crate) async fn spawn(
             // are ours to clean up here — otherwise they are simply orphaned.
             kill_and_reap(&mut child, Duration::from_secs(10)).await;
             if owns_data_dir {
-                remove_profile_dir(&user_data_dir);
+                remove_profile_dir(&user_data_dir).await;
             }
             return Err(e);
         }
@@ -182,14 +213,16 @@ pub(crate) async fn launch(
 /// [`kill_and_reap`] plus profile-dir cleanup, for an explicit `close()`.
 ///
 /// The dir can only be removed once the process is fully reaped (Chrome keeps
-/// its locks until then), so the removal runs after the wait.
+/// writing to it until then), so the removal runs after the wait — and it also
+/// costs a [`REMOVE_QUIET`] settle window, so `close()` stays a little slower
+/// than a bare kill.
 pub(crate) async fn shutdown_and_cleanup(
     child: &mut Child,
     user_data_dir: &std::path::Path,
     timeout: Duration,
 ) {
     kill_and_reap(child, timeout).await;
-    remove_profile_dir(user_data_dir);
+    remove_profile_dir(user_data_dir).await;
 }
 
 /// Unique per-launch user-data-dir (pid + seq); explicit-port launches keep

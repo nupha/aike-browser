@@ -14,14 +14,21 @@
 //     reached, so the test would pass even against the broken build; and
 //   * does NOT speak CDP        -> `CdpClient::connect` fails.
 //
-// The stand-in is a small native program compiled into %TEMP% at run time, so
-// no non-.mjs file is ever added to tests/. It must be a single process, like
-// chrome.exe: a .cmd wrapper would insert a cmd.exe layer whose grandchild
-// survives killing the direct child, which is an artifact of the wrapper rather
-// than a property of the module under test.
+// The stand-in is a small native program compiled into the temp dir at run
+// time, so no non-.mjs file is ever added to tests/. It must be a single
+// process, like chrome.exe: a shell/batch wrapper would insert an extra
+// interpreter layer whose grandchild survives killing the direct child, which
+// is an artifact of the wrapper rather than a property of the module under test.
+//
+// Liveness is probed through a heartbeat file the stand-in rewrites every tick,
+// and the profile dirs are located with `os.tmpdir()` + `fs.readDir` — the same
+// lookup the module itself uses — so this runs unchanged on Windows, macOS and
+// Linux (no shell, no `Win32_Process`, no platform path separators).
 
 import { Browser } from "browser";
 import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 
 let pass = 0;
 let fail = 0;
@@ -35,19 +42,19 @@ function check(label, condition, detail) {
   }
 }
 
-function decode(u8) {
-  return new TextDecoder().decode(u8);
-}
+const tmp = os.tmpdir();
+const isWindows = os.platform() === "win32";
 
-function sh(script) {
-  const r = Aike.spawnSync("powershell", ["-NoProfile", "-Command", script]);
-  return decode(r.stdout).trim();
+// A Rust string literal for `s`; temp paths carry backslashes on Windows.
+function rustStr(s) {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
 // A stand-in that publishes DevToolsActivePort with an ephemeral port, accepts
-// TCP connections there, and answers with plain HTTP so the WebSocket handshake
-// fails. Single process, exactly like a real browser binary.
-const STANDIN_SRC = `use std::io::Write;
+// TCP connections there, answers with plain HTTP so the WebSocket handshake
+// fails, and beats a heartbeat file for as long as it lives. Single process,
+// exactly like a real browser binary.
+const standinSrc = (beat) => `use std::io::Write;
 use std::net::TcpListener;
 
 fn main() {
@@ -69,6 +76,14 @@ fn main() {
     {
         std::process::exit(5);
     }
+    std::thread::spawn(|| {
+        let mut n: u64 = 0;
+        loop {
+            n += 1;
+            let _ = std::fs::write(${JSON.stringify(rustStr(beat))}, n.to_string());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
     for stream in listener.incoming() {
         if let Ok(mut sock) = stream {
             let _ = sock.write_all(b"HTTP/1.1 500 Not a CDP endpoint\\r\\nContent-Length: 0\\r\\n\\r\\n");
@@ -86,52 +101,50 @@ if (!rustc) {
   process.exit(0);
 }
 
-const tmp = process.env.TEMP;
 const tag = "aike-regress-" + process.pid;
-const src = tmp + "\\" + tag + ".rs";
-const standin = tmp + "\\" + tag + ".exe";
+const beat = path.join(tmp, tag + ".beat");
+const src = path.join(tmp, tag + ".rs");
+const standin = path.join(tmp, tag + (isWindows ? ".exe" : ""));
 
 // Generated outside tests/ so that directory keeps only *.mjs.
-await fs.writeText(src, STANDIN_SRC);
-const built = sh(
-  "& '" + rustc.replace(/'/g, "''") + "' -O -o '" + standin.replace(/'/g, "''") +
-    "' '" + src.replace(/'/g, "''") + "' 2>&1 | Out-String",
-);
+await fs.writeText(src, standinSrc(beat));
+const built = Aike.spawnSync(rustc, ["-O", "-o", standin, src]);
 if (!(await fs.exists(standin))) {
   console.log("could not build the stand-in -- SKIP");
-  console.log(built);
+  console.log(new TextDecoder().decode(built.stderr));
   process.exit(0);
 }
 console.log("  stand-in: " + standin);
 
-// Count live stand-in processes (single process, no wrapper).
-function orphanCount() {
-  const n = parseInt(
-    sh(
-      "@(Get-CimInstance Win32_Process -Filter \"Name='" + tag + ".exe'\" | " +
-        "Where-Object { $_.CommandLine -match 'aike-chrome-' }).Count",
-    ),
-    10,
-  );
-  return Number.isFinite(n) ? n : -1;
+// Read the heartbeat; a rising counter means the stand-in is still running.
+async function beatCount() {
+  try {
+    return Number(await fs.readText(beat));
+  } catch (_) {
+    return 0; // no beat yet, or the file is gone
+  }
 }
 
-// Names of `aike-chrome-*` profile dirs created at/after `sinceMs` (epoch ms).
-async function profileDirsCreatedAfter(sinceMs) {
-  const out = sh(
-    "$cut=[datetimeoffset]::FromUnixTimeMilliseconds(" + sinceMs + ").LocalDateTime; " +
-      "Get-ChildItem $env:TEMP -Directory -Filter 'aike-chrome-*' " +
-      "-ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -ge $cut } | " +
-      "Select-Object -ExpandProperty Name",
-  );
-  return out.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0);
+// True once the stand-in is demonstrably not running any more: either its
+// heartbeat stopped advancing, or it never beat at all.
+async function standInExited() {
+  const a = await beatCount();
+  await new Promise((r) => setTimeout(r, 1500));
+  const b = await beatCount();
+  return b === 0 || b === a;
 }
 
-// Only dirs created from now on are attributable to this run.
-const startedAt = Date.now();
+async function profileDirs() {
+  const names = [];
+  for (const e of await fs.readDir(tmp)) {
+    if (e.isDirectory && e.name.startsWith("aike-chrome-")) names.push(e.name);
+  }
+  return names;
+}
 
-const before = orphanCount();
-console.log("  orphaned stand-ins before: " + before);
+// Only dirs this run creates are attributable to it, so diff against a
+// snapshot instead of counting (leftovers from earlier runs must not fail us).
+const before = new Set(await profileDirs());
 
 let threw = false;
 let errMsg = "";
@@ -154,17 +167,17 @@ check(
 // profile dir; under load that finishes slightly later, so poll instead of
 // sampling once (a single 3s snapshot produced false failures in a full-suite
 // run on a busy machine).
-async function waitForNoNewDirs(sinceMs, timeoutMs) {
+async function waitForNoNewDirs(timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  let last = await profileDirsCreatedAfter(sinceMs);
-  while (last.length > 0 && Date.now() < deadline) {
+  let leaked = (await profileDirs()).filter((n) => !before.has(n));
+  while (leaked.length > 0 && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 250));
-    last = await profileDirsCreatedAfter(sinceMs);
+    leaked = (await profileDirs()).filter((n) => !before.has(n));
   }
-  return last;
+  return leaked;
 }
 
-const settled = await waitForNoNewDirs(startedAt, 20000);
+const settled = await waitForNoNewDirs(20000);
 console.log("  new profile dirs from this run: " + settled.length);
 check(
   "failed launch removed the profile dir it created",
@@ -172,16 +185,15 @@ check(
   "left behind: " + settled.join(", "),
 );
 
-const after = orphanCount();
-console.log("  orphaned stand-ins after: " + after);
+const exited = await standInExited();
 check(
   "no orphaned stand-in process left by the failed launch",
-  after >= 0 && after <= before,
-  "before=" + before + " after=" + after,
+  exited,
+  "heartbeat still advancing: " + (await beatCount()),
 );
 
-// Clean up the generated stand-in (rustc also emits a .pdb beside it).
-for (const p of [src, standin, standin.replace(/\.exe$/, ".pdb")]) {
+// Clean up the generated stand-in (rustc also emits a .pdb beside it on Windows).
+for (const p of [src, standin, path.join(tmp, tag + ".pdb"), beat]) {
   try {
     await fs.remove(p);
   } catch (_) {}
