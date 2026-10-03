@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
 use crate::{
+    args,
     class_page::{get_page_client, get_page_session},
     io::read_io_stream,
 };
@@ -21,11 +22,7 @@ pub(crate) fn js_page_start_tracing<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let categories = if !cc.is_empty() {
-        cc.arg(0).coerce_string(cx).unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let categories = args::opt_arg_string(cx, &cc, 0, "categories")?.unwrap_or_default();
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
     cx.promise_fut_void(async move {

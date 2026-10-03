@@ -5,6 +5,7 @@
 //! `Page` API to aike. Import it from JS as `import { Browser } from "browser"`
 //! (with the compiled `browser.aike` on the module search path).
 
+mod args;
 mod cdp;
 mod cdp_input;
 mod cdp_network;

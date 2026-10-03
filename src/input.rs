@@ -9,11 +9,15 @@
 use zuqe_zapi::*;
 
 use crate::{
+    args,
     cdp::CdpClient,
     cdp_input,
-    class_page::{get_number_prop, get_page_payload, get_str_prop, send_page_void_cmd},
+    class_page::{get_enum_prop, get_i64_prop, get_page_payload, send_page_void_cmd},
     dom::resolve_selector,
 };
+
+/// `Input.dispatchMouseEvent.button` values.
+const BUTTONS: &[&str] = &["left", "middle", "right"];
 
 /// Resolve a selector to its on-screen center via `DOM.getBoxModel`.
 async fn box_center(
@@ -51,20 +55,20 @@ async fn box_center(
 }
 
 /// Parse `options = { button?, clickCount? }`.
-fn click_options<'a>(cx: ZqCtx<'a>, cc: &ZqCallInfo<'a>) -> (String, i32) {
+fn click_options<'a>(cx: ZqCtx<'a>, cc: &ZqCallInfo<'a>) -> Result<(String, i32), ZqError> {
     let mut button = "left".to_string();
     let mut click_count = 1i32;
     if cc.len() > 2
         && let Some(opts) = cc.arg(2).as_object()
     {
-        if let Some(b) = get_str_prop(cx, &opts, "button") {
+        if let Some(b) = get_enum_prop(cx, &opts, "button", BUTTONS)? {
             button = b;
         }
-        if let Some(c) = get_number_prop(cx, &opts, "clickCount") {
-            click_count = c as i32;
+        if let Some(c) = get_i64_prop(cx, &opts, "clickCount")? {
+            click_count = args::in_range(cx, c, "clickCount", 1, 1000)? as i32;
         }
     }
-    (button, click_count)
+    Ok((button, click_count))
 }
 
 /// `page.mouseClick(x, y, options?)`
@@ -72,9 +76,9 @@ pub(crate) fn js_page_mouse_click<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let x = cc.arg_f64(cx, 0).unwrap_or(0.0);
-    let y = cc.arg_f64(cx, 1).unwrap_or(0.0);
-    let (button, click_count) = click_options(cx, &cc);
+    let x = args::arg_f64(cx, &cc, 0, "x")?;
+    let y = args::arg_f64(cx, &cc, 1, "y")?;
+    let (button, click_count) = click_options(cx, &cc)?;
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
@@ -88,8 +92,8 @@ pub(crate) fn js_page_mouse_move<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let x = cc.arg_f64(cx, 0).unwrap_or(0.0);
-    let y = cc.arg_f64(cx, 1).unwrap_or(0.0);
+    let x = args::arg_f64(cx, &cc, 0, "x")?;
+    let y = args::arg_f64(cx, &cc, 1, "y")?;
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
@@ -101,9 +105,9 @@ pub(crate) fn js_page_mouse_down<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let x = cc.arg_f64(cx, 0).unwrap_or(0.0);
-    let y = cc.arg_f64(cx, 1).unwrap_or(0.0);
-    let (button, click_count) = click_options(cx, &cc);
+    let x = args::arg_f64(cx, &cc, 0, "x")?;
+    let y = args::arg_f64(cx, &cc, 1, "y")?;
+    let (button, click_count) = click_options(cx, &cc)?;
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
@@ -117,9 +121,9 @@ pub(crate) fn js_page_mouse_up<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let x = cc.arg_f64(cx, 0).unwrap_or(0.0);
-    let y = cc.arg_f64(cx, 1).unwrap_or(0.0);
-    let (button, click_count) = click_options(cx, &cc);
+    let x = args::arg_f64(cx, &cc, 0, "x")?;
+    let y = args::arg_f64(cx, &cc, 1, "y")?;
+    let (button, click_count) = click_options(cx, &cc)?;
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
@@ -133,13 +137,13 @@ pub(crate) fn js_page_key_press<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let key = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let key = args::arg_string(cx, &cc, 0, "key")?;
     let mut modifiers = 0i32;
     if cc.len() > 1
         && let Some(opts) = cc.arg(1).as_object()
-        && let Some(m) = get_number_prop(cx, &opts, "modifiers")
+        && let Some(m) = get_i64_prop(cx, &opts, "modifiers")?
     {
-        modifiers = m as i32;
+        modifiers = args::in_range(cx, m, "modifiers", 0, i32::MAX as i64)? as i32;
     }
     // Reject an unusable key here rather than letting Chrome answer with
     // `Invalid 'text' parameter` or typing the wrong character.
@@ -163,8 +167,10 @@ pub(crate) fn js_page_drag_and_drop<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let source = cc.arg(0).coerce_string(cx).unwrap_or_default();
-    let target = cc.arg(1).coerce_string(cx).unwrap_or_default();
+    // Both selectors are required: omitting them used to drag the root element
+    // onto itself and resolve.
+    let source = args::arg_string(cx, &cc, 0, "sourceSelector")?;
+    let target = args::arg_string(cx, &cc, 1, "targetSelector")?;
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
@@ -189,7 +195,7 @@ pub(crate) fn js_page_insert_text<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let text = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let text = args::arg_string(cx, &cc, 0, "text")?;
     send_page_void_cmd(
         cx,
         &cc,

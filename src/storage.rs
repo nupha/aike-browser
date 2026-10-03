@@ -5,21 +5,19 @@
 
 use zuqe_zapi::*;
 
-use crate::class_page::{get_page_client, get_page_session, send_page_void_cmd};
+use crate::{
+    args,
+    class_page::{get_page_client, get_page_session, send_page_void_cmd},
+};
 
 /// `page.clearData(origin, storageTypes?)`
 pub(crate) fn js_page_clear_data<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let origin = cc.arg(0).coerce_string(cx).unwrap_or_default();
-    let types = if cc.len() > 1 {
-        cc.arg(1)
-            .coerce_string(cx)
-            .unwrap_or_else(|_| "all".to_string())
-    } else {
-        "all".to_string()
-    };
+    let origin = args::arg_string(cx, &cc, 0, "origin")?;
+    let types =
+        args::opt_arg_string(cx, &cc, 1, "storageTypes")?.unwrap_or_else(|| "all".to_string());
     send_page_void_cmd(
         cx,
         &cc,
@@ -38,7 +36,7 @@ pub(crate) fn js_page_get_storage_key_for_frame<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let frame_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let frame_id = args::arg_string(cx, &cc, 0, "frameId")?;
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
     cx.promise_fut_result(

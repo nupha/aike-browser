@@ -162,17 +162,34 @@ impl CdpClient {
     /// browser WS endpoint via the /json/version HTTP endpoint ?Chrome requires
     /// the `/devtools/browser/<uuid>` path which changes on every launch.
     /// URLs that already carry a path are used as-is.
-    async fn resolve_browser_url(ws_url: &str) -> Result<String, String> {
+    /// Split a `ws://` / `wss://` URL into `(http_scheme, authority, rest)`.
+    ///
+    /// The authority ends at the first `/`, `?` or `#`: splitting on `/` alone
+    /// treated `ws://host:9222?x` as an authority of `host:9222?x`, so the probe
+    /// went to `http://host:9222?x/json/version`.
+    fn split_ws_url(ws_url: &str) -> Option<(&'static str, &str, &str)> {
         let (rest, scheme) = ws_url
             .strip_prefix("wss://")
             .map(|r| (r, "https://"))
-            .or_else(|| ws_url.strip_prefix("ws://").map(|r| (r, "http://")))
-            .ok_or_else(|| format!("`cdpUrl` must be a ws:// or wss:// URL, got `{ws_url}`"))?;
+            .or_else(|| ws_url.strip_prefix("ws://").map(|r| (r, "http://")))?;
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        Some((scheme, &rest[..end], &rest[end..]))
+    }
 
-        let authority = rest.split('/').next().unwrap_or("");
-        let path = &rest[authority.len()..];
-        if !path.is_empty() && path != "/" {
+    async fn resolve_browser_url(ws_url: &str) -> Result<String, String> {
+        let (scheme, authority, rest) = Self::split_ws_url(ws_url)
+            .ok_or_else(|| format!("`cdpUrl` must be a ws:// or wss:// URL, got `{ws_url}`"))?;
+        if authority.is_empty() {
+            return Err(format!("`cdpUrl` has no host: `{ws_url}`"));
+        }
+        if rest.is_empty() || rest == "/" {
+            // Bare origin: discover the browser endpoint via /json/version.
+        } else if rest.starts_with('/') {
+            // Already a full endpoint path; use it unchanged.
             return Ok(ws_url.to_string());
+        } else {
+            // A query or fragment with no path (`ws://host?x`).
+            return Err(format!("`cdpUrl` is not a valid WebSocket URL: `{ws_url}`"));
         }
 
         let http_url = format!("{scheme}{authority}/json/version");
@@ -186,10 +203,23 @@ impl CdpClient {
             .json()
             .await
             .map_err(|e| format!("invalid /json/version response from {http_url}: {e}"))?;
-        json.get("webSocketDebuggerUrl")
+        let returned = json
+            .get("webSocketDebuggerUrl")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| format!("no webSocketDebuggerUrl in response from {http_url}"))
+            .ok_or_else(|| format!("no webSocketDebuggerUrl in response from {http_url}"))?;
+
+        // The response decides where we connect next, so require it to be a
+        // WebSocket URL for the host we actually probed; otherwise a foreign or
+        // compromised `/json/version` could redirect the connection.
+        let (_, returned_host, _) = Self::split_ws_url(returned).ok_or_else(|| {
+            format!("`webSocketDebuggerUrl` is not a ws:// or wss:// URL: `{returned}`")
+        })?;
+        if !returned_host.eq_ignore_ascii_case(authority) {
+            return Err(format!(
+                "`webSocketDebuggerUrl` host `{returned_host}` does not match the requested `{authority}`"
+            ));
+        }
+        Ok(returned.to_string())
     }
 
     /// Background loop: forward commands to WS and dispatch responses / events.
@@ -406,16 +436,28 @@ impl CdpClient {
         serde_json::to_string(&msg).unwrap()
     }
 
-    /// Send a CDP command and await its response.
-    ///
-    /// Rejects instead of hanging when the peer dies, when the command loop is
-    /// gone, when the connection was already [`Self::disconnect`]ed, or when the
-    /// command goes unanswered for [`CMD_TIMEOUT`].
+    /// Send a CDP command and await its response, bounded by [`CMD_TIMEOUT`].
     pub(crate) async fn send(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
         session_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.send_timeout(method, params, session_id, CMD_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::send`] with an explicit timeout.
+    ///
+    /// A caller with its own deadline (a selector poll, for example) must not
+    /// inherit the 30s global timeout: one stalled Chrome round-trip would then
+    /// blow past the caller's budget entirely.
+    pub(crate) async fn send_timeout(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        session_id: Option<&str>,
+        timeout: Duration,
     ) -> Result<serde_json::Value, String> {
         // Nothing reads the command channel after a disconnect, so a command
         // issued then would sit until the timeout instead of failing at once.
@@ -438,15 +480,12 @@ impl CdpClient {
             return Err("CDP command channel closed".to_string());
         }
 
-        match tokio::time::timeout(CMD_TIMEOUT, &mut rx).await {
+        match tokio::time::timeout(timeout, &mut rx).await {
             Ok(res) => res.map_err(|_| "CDP connection closed".to_string())?,
             Err(_) => {
                 // Drop the claim so a late response cannot resurrect the entry.
                 self.pending.lock().unwrap().remove(&id);
-                Err(format!(
-                    "CDP `{method}` timed out after {}s",
-                    CMD_TIMEOUT.as_secs()
-                ))
+                Err(format!("CDP `{method}` timed out after {timeout:?}"))
             }
         }
     }

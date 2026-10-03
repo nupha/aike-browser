@@ -30,6 +30,7 @@ test: build check-types
 	$(AIKE) -m tests/regression_p0_network.mjs
 	$(AIKE) -m tests/regression_p0_window.mjs
 	$(AIKE) -m tests/regression_p0_event_exit.mjs
+	$(AIKE) -m tests/regression_p3_args.mjs
 
 clean:
 	mbx clean

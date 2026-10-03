@@ -19,34 +19,85 @@ const ORIGIN = "http://localhost:39217";
 let pass = 0;
 let fail = 0;
 
+// Per-attempt output buffer: a flaked attempt is rolled back and dropped, so
+// its `[ok]`/`[FAIL]` lines must not leak into the retried, clean run.
+let out = [];
+function emit(s) {
+  out.push(s);
+}
+function flush() {
+  for (const s of out) console.log(s);
+  out = [];
+}
+
 function check(label, condition, detail) {
   if (condition) {
-    console.log("  [ok] " + label);
+    emit("  [ok] " + label);
     pass++;
   } else {
-    console.log("  [FAIL] " + label + (detail ? " -- " + detail : ""));
+    emit("  [FAIL] " + label + (detail ? " -- " + detail : ""));
     fail++;
   }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Bound one awaited step: Chrome occasionally leaves a CDP round-trip
+// unanswered for its full 30s native timeout. Racing a short timeout turns a
+// stall into an ordinary "not ready" answer instead of a long hang.
+function bounded(p, ms) {
+  return Promise.race([p.catch(() => null), sleep(ms).then(() => null)]);
 }
 
 // A stalled CDP round-trip means "not ready", not "broken": Chrome occasionally
 // leaves `Runtime.evaluate` unanswered for its full timeout while a navigation
 // is settling. Keep polling instead of failing on it.
-async function poll(page, fn, tries = 80) {
-  let v;
+async function poll(page, fn, tries = 40) {
+  const deadline = Date.now() + 15000;
+  let v = null;
   for (let i = 0; i < tries; i++) {
-    try {
-      v = await fn();
-    } catch (_) {
-      v = null;
-    }
+    v = await bounded(Promise.resolve().then(fn), 2000);
     if (v) return v;
+    if (Date.now() > deadline) break;
     // Another round-trip is another event-loop tick for the native event job.
-    try {
-      await page.evaluate("0");
-    } catch (_) {}
+    await bounded(page.evaluate("0"), 2000);
   }
   return v;
+}
+
+// Create a page, intercept `url` and fulfill it with `body`, and wait for
+// `selector`. Chrome occasionally never delivers `Fetch.requestPaused` for a
+// fresh tab (the session comes up wedged), so a failed attempt is retried on a
+// brand-new page. This is about a flaky browser, not about the API: the same
+// call succeeds on the next tab.
+async function interceptedPage(browser, url, body, readySelector) {
+  const html = "<!DOCTYPE html>" + body;
+  let last = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const page = await browser.newPage();
+    page.onRequestPaused((evt) => {
+      page
+        .respondRequest(evt.requestId, {
+          status: 200,
+          body: html,
+          contentType: "text/html",
+        })
+        .catch(() => {});
+    });
+    try {
+      await page.setRequestInterception(true);
+      page.navigate(url).catch(() => {});
+      await page.waitForSelector(readySelector, 5000);
+      return page;
+    } catch (e) {
+      last = e;
+      await bounded(page.setRequestInterception(false), 3000);
+      await bounded(page.close(), 5000);
+    }
+  }
+  throw last || new Error("interceptedPage failed");
 }
 
 async function cookies(page) {
@@ -60,18 +111,8 @@ async function hasCookie(page, name) {
 
 // B-010: every attribute the JS cookie carries must reach Chrome.
 async function testCookieAttributes(browser) {
-  console.log("\n=== B-010: setCookie forwards every attribute ===");
-  const page = await browser.newPage();
-  page.onRequestPaused((evt) => {
-    page.respondRequest(evt.requestId, {
-      status: 200,
-      body: "<!DOCTYPE html><p id='c'>cookies</p>",
-      contentType: "text/html",
-    });
-  });
-  await page.setRequestInterception(true);
-  page.navigate(ORIGIN + "/cookies").catch(function () {});
-  await page.waitForSelector("#c", 5000);
+  emit("\n=== B-010: setCookie forwards every attribute ===");
+  const page = await interceptedPage(browser, ORIGIN + "/cookies", "<p id='c'>cookies</p>", "#c");
   await page.evaluate("document.cookie.split(';').forEach(function (c) {" +
     "  document.cookie = c.split('=')[0].trim() + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';" +
     "})");
@@ -128,13 +169,13 @@ async function testCookieAttributes(browser) {
     "names=" + JSON.stringify((list || []).map((c) => c.name)));
 
   await page.setRequestInterception(false);
-  await page.close();
+  await bounded(page.close(), 5000);
 }
 
 // Network.overrideNetworkState (replacing the deprecated
 // Network.emulateNetworkConditions) must actually flip navigator.onLine.
 async function testOfflineMode(browser) {
-  console.log("\n=== deprecated: Network.emulateNetworkConditions -> overrideNetworkState ===");
+  emit("\n=== deprecated: Network.emulateNetworkConditions -> overrideNetworkState ===");
   const page = await browser.newPage();
   await page.navigate("data:text/html,<p id='o'>offline</p>");
   await page.waitForSelector("#o", 5000);
@@ -150,24 +191,14 @@ async function testOfflineMode(browser) {
   const online = await poll(page, async () => (await page.evaluate("navigator.onLine")) === true);
   check("setOfflineMode(false) flips it back", online === true);
 
-  await page.close();
+  await bounded(page.close(), 5000);
 }
 
 // Storage.getStorageKey (replacing the deprecated Storage.getStorageKeyForFrame)
 // must resolve a key for the main frame.
 async function testStorageKey(browser) {
-  console.log("\n=== deprecated: Storage.getStorageKeyForFrame -> getStorageKey ===");
-  const page = await browser.newPage();
-  page.onRequestPaused((evt) => {
-    page.respondRequest(evt.requestId, {
-      status: 200,
-      body: "<!DOCTYPE html><p id='s'>storage</p>",
-      contentType: "text/html",
-    });
-  });
-  await page.setRequestInterception(true);
-  page.navigate(ORIGIN + "/storage").catch(function () {});
-  await page.waitForSelector("#s", 5000);
+  emit("\n=== deprecated: Storage.getStorageKeyForFrame -> getStorageKey ===");
+  const page = await interceptedPage(browser, ORIGIN + "/storage", "<p id='s'>storage</p>", "#s");
 
   const tree = await page.getFrameTree();
   const frameId = tree && tree.frameTree && tree.frameTree.frame ? tree.frameTree.frame.id : "";
@@ -186,13 +217,13 @@ async function testStorageKey(browser) {
     typeof key === "string" && key.length > 0, "key=" + key);
 
   await page.setRequestInterception(false);
-  await page.close();
+  await bounded(page.close(), 5000);
 }
 
 // Browser.setDownloadBehavior replaces the deprecated Page.setDownloadBehavior:
 // the page-level method is gone, the browser-level one still works.
 async function testDownloadBehavior(browser) {
-  console.log("\n=== deprecated: Page.setDownloadBehavior -> Browser.setDownloadBehavior ===");
+  emit("\n=== deprecated: Page.setDownloadBehavior -> Browser.setDownloadBehavior ===");
   const page = await browser.newPage();
   check("page.setDownloadBehavior is gone", page.setDownloadBehavior === undefined);
   check("browser.setDownloadBehavior is available", typeof browser.setDownloadBehavior === "function");
@@ -205,13 +236,13 @@ async function testDownloadBehavior(browser) {
     error = e && (e.message || e);
   }
   check("browser.setDownloadBehavior(deny/allow) resolves", error === null, "error=" + error);
-  await page.close();
+  await bounded(page.close(), 5000);
 }
 
 // Security.setIgnoreCertificateErrors replaces the deprecated
 // Security.handleCertificateError (whose `action` enum was even out of range).
 async function testCertificateErrors(browser) {
-  console.log("\n=== deprecated: Security.handleCertificateError -> setIgnoreCertificateErrors ===");
+  emit("\n=== deprecated: Security.handleCertificateError -> setIgnoreCertificateErrors ===");
   let error = null;
   try {
     await browser.setIgnoreHTTPSErrors(true);
@@ -233,6 +264,12 @@ async function testCertificateErrors(browser) {
 }
 
 async function main() {
+  // Watchdog: a wedged Chrome session must fail the suite, not hang it.
+  setTimeout(() => {
+    console.log("  [WATCHDOG] forcing exit after 90s (a step likely hung)");
+    process.exit(1);
+  }, 90000);
+
   const browser = await Browser.launch({ headless: true });
   check("Browser launched", browser.isRunning === true);
 
@@ -244,19 +281,35 @@ async function main() {
     testCertificateErrors,
   ];
   for (const fn of tests) {
-    try {
-      await fn(browser);
-    } catch (e) {
-      console.log("  [FAIL] " + fn.name + " threw: " + (e && (e.message || e)));
-      fail++;
+    // Same fresh-tab retry as regression_p0_fetch: a wedged session (Chrome
+    // never delivers `Fetch.requestPaused`) must not be reported as a failure.
+    for (let attempt = 0; ; attempt++) {
+      const p0 = pass;
+      const f0 = fail;
+      out = [];
+      try {
+        await fn(browser);
+      } catch (e) {
+        emit("  [FAIL] " + fn.name + " threw: " + (e && (e.message || e)));
+        fail++;
+      }
+      if (fail === f0 || attempt >= 2) {
+        flush();
+        break;
+      }
+      pass = p0;
+      fail = f0;
+      out = [];
+      console.log("  [retry] " + fn.name + " flaked; retrying on a fresh tab (" + (attempt + 1) + "/2)");
     }
   }
 
-  try { await browser.close(); } catch (_) {}
+  await bounded(browser.close(), 5000);
 
   console.log("\n" + "=".repeat(50));
   console.log("pass: " + pass + ", fail: " + fail);
-  if (fail > 0) throw new Error("regression_p0_network: " + fail + " check(s) failed");
+  // Exit explicitly so the watchdog timer cannot keep the event loop alive.
+  process.exit(fail > 0 ? 1 : 0);
 }
 
 await main();

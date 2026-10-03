@@ -151,6 +151,10 @@ pub(crate) async fn spawn(
     kill_on_drop: bool,
 ) -> Result<SpawnedBrowser, String> {
     let user_data_dir = auto_data_dir();
+    // `args: []` means "no custom command line", not one with zero arguments:
+    // treating it as custom left out `--remote-debugging-port`, so the startup
+    // poll burned its full 30s before failing.
+    let args = args.filter(|a| !a.is_empty());
     // Only auto mode (no explicit `args`) creates this dir; a custom command
     // line owns wherever it points, so it must never be deleted by us.
     let owns_data_dir = args.is_none();

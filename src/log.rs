@@ -11,7 +11,9 @@ use std::{
 use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
-use crate::{Listener, class_page::send_page_void_cmd, helpers, require_callback, with_state};
+use crate::{
+    Listener, args, class_page::send_page_void_cmd, helpers, require_callback, with_state,
+};
 
 /// Buffered console/log entries of one page.
 ///
@@ -109,6 +111,9 @@ pub(crate) fn js_page_on_log<'a>(
             .insert(session_id.clone(), callback);
     });
 
+    // Subscribe before enabling: an event emitted between `Log.enable` /
+    // `Runtime.enable` and a receiver created later would be dropped.
+    let event_rx = client.subscribe_events();
     // Both domains feed this listener, and `Runtime` has to be on for
     // `console.log` to show up at all — enabling only `Log` silently delivered
     // network and JavaScript errors only.
@@ -134,10 +139,10 @@ pub(crate) fn js_page_on_log<'a>(
         }
     });
 
-    let client_ev = client.clone();
     let session_ev = session_id.clone();
     let task = helpers::spawn(async move {
-        let mut event_rx = client_ev.subscribe_events();
+        // `event_rx` was subscribed synchronously before the enables above.
+        let mut event_rx = event_rx;
         loop {
             match event_rx.recv().await {
                 Ok(evt) if evt.shutdown => break,
@@ -180,7 +185,7 @@ pub(crate) fn js_page_get_console_messages<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let clear = cc.len() > 0 && cc.arg_bool(cx, 0).unwrap_or(false);
+    let clear = args::opt_arg_bool(cx, &cc, 0, "clear")?.unwrap_or(false);
     let buffer = crate::class_page::get_page_payload(cx, cc.this())?
         .log_buffer
         .clone();

@@ -6,7 +6,7 @@
 use base64::Engine as _;
 use zuqe_zapi::*;
 
-use crate::{cdp::CdpClient, class_page::get_page_payload};
+use crate::{args, cdp::CdpClient, class_page::get_page_payload};
 
 /// Read a CDP IO stream (`handle`) to completion and return its UTF-8 text.
 ///
@@ -87,7 +87,7 @@ pub(crate) fn js_page_read_stream<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let handle = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let handle = args::arg_string(cx, &cc, 0, "handle")?;
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();

@@ -6,6 +6,7 @@
 use zuqe_zapi::*;
 
 use crate::{
+    args,
     class_page::{get_page_client, get_page_session},
     dom,
 };
@@ -15,7 +16,7 @@ pub(crate) fn js_page_get_computed_style<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
     cx.promise_fut_json(async move {
@@ -50,7 +51,7 @@ pub(crate) fn js_page_get_matched_styles<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
     cx.promise_fut_json(async move {

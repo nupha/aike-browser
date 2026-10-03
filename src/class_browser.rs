@@ -16,9 +16,9 @@ use zuqe_zapi::*;
 use zuqe_zapi_macros::{zq_class, zq_class_impl, zq_method, zq_static_method};
 
 use crate::{
-    cdp, chrome,
+    args, cdp, chrome,
     class_page::{
-        JSPage, get_array_prop, get_bool_prop, get_enum_prop, get_number_prop, get_str_prop,
+        JSPage, get_array_prop, get_bool_prop, get_enum_prop, get_i64_prop, get_str_prop,
         new_page_payload,
     },
 };
@@ -63,13 +63,15 @@ impl JSBrowser {
         if !cc.is_empty()
             && let Some(opts) = cc.arg(0).as_object()
         {
-            req.proxy_url = get_str_prop(cx, &opts, "proxyUrl");
-            req.chrome_path = get_str_prop(cx, &opts, "chromePath");
-            req.cdp_url = get_str_prop(cx, &opts, "cdpUrl");
-            if let Some(v) = get_number_prop(cx, &opts, "port") {
-                req.port = v as u16;
+            req.proxy_url = get_str_prop(cx, &opts, "proxyUrl")?;
+            req.chrome_path = get_str_prop(cx, &opts, "chromePath")?;
+            req.cdp_url = get_str_prop(cx, &opts, "cdpUrl")?;
+            if let Some(v) = get_i64_prop(cx, &opts, "port")? {
+                // A port is 0 (auto-assign) or a real TCP port; `as u16` used to
+                // wrap `-1` to 0 and saturate `70000` to 65535.
+                req.port = args::in_range(cx, v, "port", 0, 65535)? as u16;
             }
-            if let Some(h) = get_bool_prop(cx, &opts, "headless") {
+            if let Some(h) = get_bool_prop(cx, &opts, "headless")? {
                 req.headless = h;
             }
         }
@@ -79,10 +81,7 @@ impl JSBrowser {
     /// `Browser.connect(cdpUrl)` → Promise<Browser>
     #[zq_static_method]
     fn connect<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let url = cc.arg(0).try_string_read_utf8(cx);
-        let Some(cdp_url) = url else {
-            return Err(cx.throw_type("`connect` requires a `cdpUrl` string (ws://...)"));
-        };
+        let cdp_url = args::arg_string(cx, &cc, 0, "cdpUrl")?;
         browser_promise(
             cx,
             LaunchRequest {
@@ -104,27 +103,30 @@ impl JSBrowser {
         if !cc.is_empty()
             && let Some(opts) = cc.arg(0).as_object()
         {
-            bin = get_str_prop(cx, &opts, "bin");
-            proxy_url = get_str_prop(cx, &opts, "proxyUrl");
-            if let Some(v) = get_number_prop(cx, &opts, "port") {
-                port = v as u16;
+            bin = get_str_prop(cx, &opts, "bin")?;
+            proxy_url = get_str_prop(cx, &opts, "proxyUrl")?;
+            if let Some(v) = get_i64_prop(cx, &opts, "port")? {
+                port = args::in_range(cx, v, "port", 0, 65535)? as u16;
             }
-            if let Some(h) = get_bool_prop(cx, &opts, "headless") {
+            if let Some(h) = get_bool_prop(cx, &opts, "headless")? {
                 headless = h;
             }
-            if let Some(arr) = get_array_prop(cx, &opts, "args")
-                && let Ok(len) = arr.length(cx)
-            {
+            if let Some(arr) = get_array_prop(cx, &opts, "args")? {
+                let len = arr.length(cx)?;
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
-                    let s = arr.get_index(cx, i as u32)?.coerce_string(cx)?;
+                    let s =
+                        args::to_string(cx, arr.get_index(cx, i as u32)?, &format!("args[{i}]"))?;
                     out.push(s);
                 }
                 args = Some(out);
             }
         }
 
-        if args.is_some() && bin.is_none() {
+        // `args: []` is "no custom command line", not a custom one with zero
+        // arguments (which would leave out `--remote-debugging-port` and hang
+        // the startup poll for 30s).
+        if args.as_ref().is_some_and(|a| !a.is_empty()) && bin.is_none() {
             return Err(cx.throw_type("`spawn`: `args` requires `bin`"));
         }
 
@@ -172,14 +174,22 @@ impl JSBrowser {
 
         let mut url = "about:blank".to_string();
         let mut context_id: Option<String> = None;
-        if !cc.is_empty() {
-            if let Some(s) = cc.arg(0).try_string_read_utf8(cx) {
-                url = s;
-            } else if let Some(obj) = cc.arg(0).as_object() {
-                if let Some(u) = get_str_prop(cx, &obj, "url") {
+        let first = cc.arg(0);
+        // Only a string or an options object is accepted. `newPage(42)` and
+        // `newPage(null)` used to fall through to `about:blank` silently.
+        if !first.is_undefined() {
+            if let Some(obj) = first.as_object() {
+                if let Some(u) = get_str_prop(cx, &obj, "url")? {
                     url = u;
                 }
-                context_id = get_str_prop(cx, &obj, "contextId");
+                if let Some(cid) = get_str_prop(cx, &obj, "contextId")? {
+                    if cid.is_empty() {
+                        return Err(cx.throw_range("`contextId` must not be empty"));
+                    }
+                    context_id = Some(cid);
+                }
+            } else {
+                url = args::to_string(cx, first, "urlOrOpts")?;
             }
         }
 
@@ -334,27 +344,30 @@ impl JSBrowser {
     /// `browser.setWindowBounds(bounds)`
     #[zq_method(name = "setWindowBounds")]
     fn set_window_bounds<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
+        let obj = cc
+            .arg(0)
+            .as_object()
+            .ok_or_else(|| cx.throw_type("`bounds` must be an object"))?;
         let mut bounds = serde_json::Map::new();
-        if !cc.is_empty()
-            && let Some(obj) = cc.arg(0).as_object()
-        {
-            if let Some(v) = get_number_prop(cx, &obj, "left") {
-                bounds.insert("left".into(), serde_json::Value::from(v as i32));
+        // Geometry is integer: `as i32` used to truncate `2.7` to 2 (which the
+        // renderer would have rejected) and accept a string like `"300"`.
+        let mut has_geometry = false;
+        for key in ["left", "top", "width", "height"] {
+            if let Some(v) = get_i64_prop(cx, &obj, key)? {
+                bounds.insert(key.into(), serde_json::Value::from(v));
+                has_geometry = true;
             }
-            if let Some(v) = get_number_prop(cx, &obj, "top") {
-                bounds.insert("top".into(), serde_json::Value::from(v as i32));
+        }
+        // An unknown state is not merely a rejected command: Chrome aborts the
+        // whole browser process, taking every page with it. Validate first.
+        if let Some(state) = get_enum_prop(cx, &obj, "windowState", WINDOW_STATES)? {
+            // The protocol forbids combining a non-`normal` state with geometry.
+            if has_geometry && state != "normal" {
+                return Err(cx.throw_range(
+                    "`windowState` cannot be combined with `left`/`top`/`width`/`height` unless it is \"normal\"",
+                ));
             }
-            if let Some(v) = get_number_prop(cx, &obj, "width") {
-                bounds.insert("width".into(), serde_json::Value::from(v as i32));
-            }
-            if let Some(v) = get_number_prop(cx, &obj, "height") {
-                bounds.insert("height".into(), serde_json::Value::from(v as i32));
-            }
-            // An unknown state is not merely a rejected command: Chrome aborts the
-            // whole browser process, taking every page with it. Validate first.
-            if let Some(state) = get_enum_prop(cx, &obj, "windowState", WINDOW_STATES)? {
-                bounds.insert("windowState".into(), serde_json::Value::String(state));
-            }
+            bounds.insert("windowState".into(), serde_json::Value::String(state));
         }
 
         let client = get_browser_payload(cx, cc.this())?.client.clone();
@@ -380,7 +393,7 @@ impl JSBrowser {
         cx: ZqCtx<'a>,
         cc: ZqCallInfo<'a>,
     ) -> Result<ZqValue<'a>, ZqError> {
-        let path = cc.arg(0).coerce_string(cx).unwrap_or_default();
+        let path = args::arg_string(cx, &cc, 0, "path")?;
         let params = if path.is_empty() {
             serde_json::json!({ "behavior": "deny" })
         } else {
@@ -597,7 +610,9 @@ impl JSBrowserProcess {
         if p.killed.load(Ordering::SeqCst) {
             return Ok(ZqValue::null());
         }
-        Ok(ZqValue::int32(p.pid as i32))
+        // A Windows pid is an unsigned 32-bit value; `as i32` could report a
+        // perfectly live process as a negative pid.
+        Ok(ZqValue::number(p.pid as f64))
     }
 }
 

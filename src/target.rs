@@ -5,7 +5,7 @@
 
 use zuqe_zapi::*;
 
-use crate::class_browser::get_browser_payload;
+use crate::{args, class_browser::get_browser_payload};
 
 /// `browser.getTargets()`
 ///
@@ -67,7 +67,7 @@ pub(crate) fn js_browser_dispose_context<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let context_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let context_id = args::arg_string(cx, &cc, 0, "contextId")?;
     let client = get_browser_payload(cx, cc.this())?.client.clone();
     cx.promise_fut_void(async move {
         client

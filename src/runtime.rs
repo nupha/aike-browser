@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
 use crate::{
-    Listener,
+    Listener, args,
     class_page::{get_page_client, get_page_session},
     helpers::{self, format_exception},
     require_callback, with_state,
@@ -20,8 +20,8 @@ pub(crate) fn js_page_call_function_on<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let object_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
-    let fn_src = cc.arg(1).coerce_string(cx).unwrap_or_default();
+    let object_id = args::arg_string(cx, &cc, 0, "objectId")?;
+    let fn_src = args::arg_string(cx, &cc, 1, "functionDeclaration")?;
 
     let mut call_args = Vec::new();
     if cc.len() > 2
@@ -29,9 +29,15 @@ pub(crate) fn js_page_call_function_on<'a>(
         && let Ok(len) = arr.length(cx)
     {
         for i in 0..len {
-            if let Ok(item) = arr.get_index(cx, i as u32) {
-                call_args.push(serde_json::json!({ "value": item.to_json(cx).unwrap_or(serde_json::Value::Null) }));
-            }
+            let item = arr.get_index(cx, i as u32)?;
+            // `to_json` returns `None` for values JSON cannot represent
+            // (`undefined`, functions, symbols); forwarding that as `null` was a
+            // silent substitution, and the failed `JSON.stringify` left a
+            // pending exception behind.
+            let json = item
+                .to_json(cx)
+                .ok_or_else(|| cx.throw_type(&format!("`args[{i}]` is not JSON-serializable")))?;
+            call_args.push(serde_json::json!({ "value": json }));
         }
     }
 
@@ -68,7 +74,7 @@ pub(crate) fn js_page_get_properties<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let object_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let object_id = args::arg_string(cx, &cc, 0, "objectId")?;
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
     cx.promise_fut_json(async move {
@@ -127,7 +133,7 @@ pub(crate) fn js_page_evaluate_handle<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let expr = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let expr = args::arg_string(cx, &cc, 0, "expression")?;
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
     cx.promise_fut_json(async move {
@@ -174,6 +180,9 @@ pub(crate) fn js_page_on_console<'a>(
             .insert(session_id.clone(), callback);
     });
 
+    // Subscribe before enabling: an event emitted between `Runtime.enable` and
+    // a receiver created later would be dropped.
+    let event_rx = client.subscribe_events();
     let _ = crate::class_page::send_page_void_cmd(cx, &cc, "Runtime.enable", None);
 
     let tx = cx.spawn_event_job("console", move |cx, msg: serde_json::Value| {
@@ -195,10 +204,10 @@ pub(crate) fn js_page_on_console<'a>(
         }
     });
 
-    let client_ev = client.clone();
     let session_ev = session_id.clone();
     let task = helpers::spawn(async move {
-        let mut event_rx = client_ev.subscribe_events();
+        // `event_rx` was subscribed synchronously before `Runtime.enable`.
+        let mut event_rx = event_rx;
         loop {
             match event_rx.recv().await {
                 Ok(evt) if evt.shutdown => break,

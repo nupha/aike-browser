@@ -6,8 +6,10 @@
 use zuqe_zapi::*;
 
 use crate::{
+    args,
     class_page::{
-        get_bool_prop, get_number_prop, get_page_client, get_page_session, send_page_void_cmd,
+        get_bool_prop, get_number_prop, get_object_prop, get_page_client, get_page_session,
+        send_page_void_cmd,
     },
     dom,
 };
@@ -26,16 +28,16 @@ pub(crate) fn js_page_highlight<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let mut config = default_highlight_config();
     if cc.len() > 1
         && let Some(opts) = cc.arg(1).as_object()
     {
-        if let Some(info) = get_bool_prop(cx, &opts, "showInfo") {
+        if let Some(info) = get_bool_prop(cx, &opts, "showInfo")? {
             config["showInfo"] = serde_json::Value::Bool(info);
         }
         for &key in HIGHLIGHT_COLORS {
-            let Some(color) = opts.try_get_object_str(cx, key) else {
+            let Some(color) = get_object_prop(cx, &opts, key)? else {
                 continue;
             };
             config[key] = rgba(cx, &color, key)?;
@@ -73,10 +75,12 @@ pub(crate) fn js_page_highlight<'a>(
 /// reject a fractional `r` outright (`int32 value expected`), which is also why
 /// the defaults below are written the same way.
 fn rgba(cx: ZqCtx, color: &ZqValue, key: &str) -> Result<serde_json::Value, ZqError> {
-    let channel = |name: &str, default: f64| get_number_prop(cx, color, name).unwrap_or(default);
+    let channel = |name: &str, default: f64| -> Result<f64, ZqError> {
+        Ok(get_number_prop(cx, color, name)?.unwrap_or(default))
+    };
     let mut out = serde_json::Map::new();
     for name in ["r", "g", "b"] {
-        let v = channel(name, 0.0);
+        let v = channel(name, 0.0)?;
         if !(0.0..=255.0).contains(&v) || v.fract() != 0.0 {
             return Err(cx.throw_range(&format!(
                 "highlight `{key}.{name}` must be an integer within 0..255"
@@ -84,7 +88,7 @@ fn rgba(cx: ZqCtx, color: &ZqValue, key: &str) -> Result<serde_json::Value, ZqEr
         }
         out.insert(name.into(), serde_json::json!(v));
     }
-    let a = channel("a", 1.0);
+    let a = channel("a", 1.0)?;
     if !(0.0..=1.0).contains(&a) {
         return Err(cx.throw_range(&format!("highlight `{key}.a` must be within 0..1")));
     }

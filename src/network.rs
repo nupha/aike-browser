@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
 use crate::{
-    cdp_network,
+    args, cdp_network,
     class_page::{
         get_bool_prop, get_enum_prop, get_number_prop, get_page_payload, get_str_prop,
         send_page_void_cmd,
@@ -27,19 +27,19 @@ fn cookie_fields_to_params(
     params: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), ZqError> {
     for key in ["name", "value", "domain", "path"] {
-        if let Some(v) = get_str_prop(cx, cookie, key) {
+        if let Some(v) = get_str_prop(cx, cookie, key)? {
             params.insert(key.into(), serde_json::Value::String(v));
         }
     }
     for key in ["httpOnly", "secure"] {
-        if let Some(v) = get_bool_prop(cx, cookie, key) {
+        if let Some(v) = get_bool_prop(cx, cookie, key)? {
             params.insert(key.into(), serde_json::Value::Bool(v));
         }
     }
     if let Some(same_site) = get_enum_prop(cx, cookie, "sameSite", COOKIE_SAME_SITE)? {
         params.insert("sameSite".into(), serde_json::Value::String(same_site));
     }
-    if let Some(expires) = get_number_prop(cx, cookie, "expires") {
+    if let Some(expires) = get_number_prop(cx, cookie, "expires")? {
         params.insert("expires".into(), serde_json::json!(expires));
     }
     Ok(())
@@ -147,7 +147,7 @@ pub(crate) fn js_page_set_user_agent<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let ua = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let ua = args::arg_string(cx, &cc, 0, "userAgent")?;
     send_page_void_cmd(
         cx,
         &cc,
@@ -161,13 +161,15 @@ pub(crate) fn js_page_set_extra_http_headers<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let headers = if cc.len() > 0
-        && let Some(obj) = cc.arg(0).as_object()
-    {
-        obj.to_json(cx).unwrap_or(serde_json::Value::Null)
-    } else {
-        serde_json::json!({})
-    };
+    // Require an object whose values are all strings. A non-object used to
+    // become `headers: {}` (silently clearing every header), and a failed
+    // `to_json` became `headers: null`, which Chrome rejects with "not an
+    // object".
+    let obj = cc
+        .arg(0)
+        .as_object()
+        .ok_or_else(|| cx.throw_type("`headers` must be an object"))?;
+    let headers = args::string_map(cx, &obj, "headers")?;
     send_page_void_cmd(
         cx,
         &cc,
@@ -185,7 +187,7 @@ pub(crate) fn js_page_set_offline_mode<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let offline = cc.arg_bool(cx, 0).unwrap_or(false);
+    let offline = args::arg_bool(cx, &cc, 0, "enabled")?;
     send_page_void_cmd(
         cx,
         &cc,
@@ -204,7 +206,7 @@ pub(crate) fn js_page_set_cache_disabled<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let disabled = cc.arg_bool(cx, 0).unwrap_or(false);
+    let disabled = args::arg_bool(cx, &cc, 0, "disabled")?;
     send_page_void_cmd(
         cx,
         &cc,
@@ -218,23 +220,22 @@ pub(crate) fn js_page_set_cookies<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let mut cookies = Vec::new();
-    if !cc.is_empty()
-        && let Some(arr) = cc.arg(0).as_array(cx)?
-        && let Ok(len) = arr.length(cx)
-    {
-        for i in 0..len {
-            let Ok(item) = arr.get_index(cx, i as u32) else {
-                continue;
-            };
-            if let Some(obj) = item.as_object() {
-                // Same field set as `setCookie`, so a batch read back from
-                // `getCookies()` keeps `sameSite` / `expires` / `httpOnly`.
-                let mut c = serde_json::Map::new();
-                cookie_fields_to_params(cx, &obj, &mut c)?;
-                cookies.push(serde_json::Value::Object(c));
-            }
-        }
+    let arr = cc
+        .arg(0)
+        .as_array(cx)?
+        .ok_or_else(|| cx.throw_type("`cookies` must be an array"))?;
+    let len = arr.length(cx)?;
+    let mut cookies = Vec::with_capacity(len);
+    for i in 0..len {
+        let item = arr.get_index(cx, i as u32)?;
+        let obj = item
+            .as_object()
+            .ok_or_else(|| cx.throw_type(&format!("`cookies[{i}]` must be an object")))?;
+        // Same field set as `setCookie`, so a batch read back from
+        // `getCookies()` keeps `sameSite` / `expires` / `httpOnly`.
+        let mut c = serde_json::Map::new();
+        cookie_fields_to_params(cx, &obj, &mut c)?;
+        cookies.push(serde_json::Value::Object(c));
     }
     send_page_void_cmd(
         cx,
@@ -249,10 +250,10 @@ pub(crate) fn js_page_delete_cookie<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let name = cc.arg(0).coerce_string(cx).unwrap_or_default();
-    let url = cc.arg(1).coerce_string(cx).unwrap_or_default();
+    let name = args::arg_string(cx, &cc, 0, "name")?;
+    let url = args::opt_arg_string(cx, &cc, 1, "url")?;
     let mut params = serde_json::json!({ "name": name });
-    if !url.is_empty() {
+    if let Some(url) = url {
         params["url"] = serde_json::Value::String(url);
     }
     send_page_void_cmd(cx, &cc, "Network.deleteCookies", Some(params))
@@ -275,7 +276,7 @@ pub(crate) fn js_page_get_response_body<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let request_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let request_id = args::arg_string(cx, &cc, 0, "requestId")?;
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
@@ -297,9 +298,11 @@ pub(crate) fn js_page_start_network_capture<'a>(
 
     cx.promise_fut_result(
         async move {
+            // Subscribe before `Network.enable`, so an event emitted while the
+            // domain is switching on cannot be dropped.
+            let mut event_rx = client.subscribe_events();
             cdp_network::enable_network(&client, &session_id).await?;
 
-            let mut event_rx = client.subscribe_events();
             let session_cap = session_id.clone();
             let recorder = network.clone();
             // No poll interval and no stop flag: the loop is woken by the event
@@ -369,7 +372,7 @@ pub(crate) fn js_page_get_request_post_data<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let request_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let request_id = args::arg_string(cx, &cc, 0, "requestId")?;
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();

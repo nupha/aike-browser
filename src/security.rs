@@ -8,7 +8,7 @@ use zuqe_zapi::*;
 use zuqe_zapi_macros::zq_function;
 
 use crate::{
-    Listener, class_browser::get_browser_payload, helpers, next_cert_magic, require_callback,
+    Listener, args, class_browser::get_browser_payload, helpers, next_cert_magic, require_callback,
     with_state,
 };
 
@@ -17,7 +17,7 @@ pub(crate) fn js_browser_set_ignore_https_errors<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let enabled = cc.arg_bool(cx, 0).unwrap_or(false);
+    let enabled = args::arg_bool(cx, &cc, 0, "enabled")?;
     crate::class_browser::send_browser_void_cmd(
         cx,
         &cc,
@@ -41,7 +41,7 @@ pub(crate) fn js_cert_accept<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let accept = cc.arg_bool(cx, 0).unwrap_or(false);
+    let accept = args::arg_bool(cx, &cc, 0, "enabled")?;
     let client = with_state(cx, |st| st.cert_client(cc.magic()));
     if let Some(client) = client {
         client.send_detached(

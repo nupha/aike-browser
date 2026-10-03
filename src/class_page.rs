@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
-//! Page class 鈥?the main browser tab/page abstraction.
-
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use tokio::sync::broadcast;
 use zuqe_zapi::*;
 use zuqe_zapi_macros::{zq_class, zq_class_impl, zq_method};
 
-use crate::{cdp, helpers, input, log::LogBuffer, network};
+use crate::{args, cdp, helpers, input, log::LogBuffer, network};
 
 // ---------------------------------------------------------------------------
 // Network capture state
@@ -21,6 +21,9 @@ use crate::{cdp, helpers, input, log::LogBuffer, network};
 /// events fire thousands of times for a single page load, so an unbounded
 /// vector turned "capture a page" into an allocation that never stops growing.
 pub(crate) const CAPTURE_CAP: usize = 5000;
+
+/// `Page.captureScreenshot.format` values.
+const SCREENSHOT_FORMATS: &[&str] = &["png", "jpeg", "webp"];
 
 /// Network capture state for one page.
 ///
@@ -131,12 +134,10 @@ impl JSPage {
         Err(cx.throw_type("Page cannot be constructed directly; use browser.newPage()"))
     }
 
-    // 鈹€鈹€ Page domain 鈹€鈹€
-
     /// `page.navigate(url)` 鈥?rejects when the navigation itself failed.
     #[zq_method]
     fn navigate<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let url = cc.arg(0).coerce_string(cx).unwrap_or_default();
+        let url = args::arg_string(cx, &cc, 0, "url")?;
         let payload = get_page_payload(cx, cc.this())?;
         let client = payload.client.clone();
         let session_id = payload.session_id.clone();
@@ -172,8 +173,8 @@ impl JSPage {
     /// `page.waitForSelector(selector, timeoutMs?)`
     #[zq_method(name = "waitForSelector")]
     fn wait_for_selector<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
-        let timeout_ms = timeout_ms_or_default(cx, &cc, 1, 30_000);
+        let selector = args::arg_string(cx, &cc, 0, "selector")?;
+        let timeout_ms = timeout_ms_or_default(cx, &cc, 1, 30_000)?;
 
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
@@ -220,16 +221,36 @@ impl JSPage {
                         return Err("selector not found or timed out".to_string());
                     }
                     let attempt_ms = remaining.as_millis().min(1000) as i64;
-                    let val = client
-                        .send(
+                    // Bound the round-trip by the caller's own budget. The
+                    // global 30s timeout meant a single stalled evaluate blew
+                    // through `timeoutMs` and surfaced a 30s error instead of
+                    // just retrying; a dead connection is still fatal.
+                    let bound = remaining.min(Duration::from_millis(2000));
+                    let val = match client
+                        .send_timeout(
                             "Runtime.evaluate",
                             Some(serde_json::json!({
                                 "expression": js_code(attempt_ms),
                                 "awaitPromise": true,
                             })),
                             Some(&session_id),
+                            bound,
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if client.is_closed() {
+                                return Err(e);
+                            }
+                            log::debug!("waitForSelector: evaluate did not answer ({e}); retrying");
+                            if start.elapsed() >= overall {
+                                return Err("selector not found or timed out".to_string());
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    };
                     let Some(details) = val.get("exceptionDetails") else {
                         return Ok(());
                     };
@@ -251,8 +272,8 @@ impl JSPage {
     /// `page.waitForFunction(expression, timeoutMs?)`
     #[zq_method(name = "waitForFunction")]
     fn wait_for_function<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let expr = cc.arg(0).coerce_string(cx).unwrap_or_default();
-        let timeout_ms = timeout_ms_or_default(cx, &cc, 1, 30_000);
+        let expr = args::arg_string(cx, &cc, 0, "expression")?;
+        let timeout_ms = timeout_ms_or_default(cx, &cc, 1, 30_000)?;
 
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
@@ -272,11 +293,16 @@ impl JSPage {
                      tick();\
                      }})"
                 );
+                // The generated promise carries the whole budget; bound the
+                // round-trip just past it so a stalled evaluate reports the
+                // timeout instead of the global 30s.
+                let bound = Duration::from_millis(timeout_ms.max(0) as u64 + 1000);
                 let val = client
-                    .send(
+                    .send_timeout(
                         "Runtime.evaluate",
                         Some(serde_json::json!({ "expression": js, "awaitPromise": true })),
                         Some(&session_id),
+                        bound,
                     )
                     .await?;
                 if val.get("exceptionDetails").is_some() {
@@ -292,7 +318,7 @@ impl JSPage {
     /// `page.evaluate(jsCode)`
     #[zq_method]
     fn evaluate<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let js_code = cc.arg(0).coerce_string(cx).unwrap_or_default();
+        let js_code = args::arg_string(cx, &cc, 0, "jsCode")?;
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
@@ -373,41 +399,50 @@ impl JSPage {
         let mut from_surface = None::<bool>;
         let mut optimize_for_speed = None::<bool>;
 
-        if cc.len() > 0
+        if !cc.is_empty()
             && let Some(opts) = cc.arg(0).as_object()
         {
-            if let Some(f) = get_str_prop(cx, &opts, "format") {
+            if let Some(f) = get_enum_prop(cx, &opts, "format", SCREENSHOT_FORMATS)? {
                 format = f;
             }
-            if let Some(q) = get_number_prop(cx, &opts, "quality") {
-                quality = Some(q as i32);
+            if let Some(q) = get_i64_prop(cx, &opts, "quality")? {
+                // `quality` is 1-100, and only the lossy formats accept it.
+                // `as i32` used to truncate `1.9` to 1 and pass `300` through to
+                // Chrome; `{}.valueOf()` produced 0.
+                quality = Some(args::in_range(cx, q, "quality", 1, 100)? as i32);
             }
-            if let Some(clip_obj) = get_object_prop(cx, &opts, "clip")
-                && let (Some(x), Some(y), Some(w), Some(h)) = (
-                    get_number_prop(cx, &clip_obj, "x"),
-                    get_number_prop(cx, &clip_obj, "y"),
-                    get_number_prop(cx, &clip_obj, "width"),
-                    get_number_prop(cx, &clip_obj, "height"),
-                )
-            {
-                let mut c = serde_json::json!({ "x": x, "y": y, "width": w, "height": h });
-                if let Some(s) = get_number_prop(cx, &clip_obj, "scale") {
+            if let Some(clip_obj) = get_object_prop(cx, &opts, "clip")? {
+                let req = |key: &str| -> Result<f64, ZqError> {
+                    get_number_prop(cx, &clip_obj, key)?
+                        .ok_or_else(|| cx.throw_type(&format!("`clip.{key}` is required")))
+                };
+                let mut c = serde_json::json!({
+                    "x": req("x")?,
+                    "y": req("y")?,
+                    "width": req("width")?,
+                    "height": req("height")?,
+                });
+                if let Some(s) = get_number_prop(cx, &clip_obj, "scale")? {
                     c["scale"] = serde_json::json!(s);
                 }
                 clip = Some(c);
             }
-            if let Some(fp) = get_bool_prop(cx, &opts, "fullPage") {
+            if let Some(fp) = get_bool_prop(cx, &opts, "fullPage")? {
                 capture_beyond_viewport = Some(fp);
             }
-            if let Some(b) = get_bool_prop(cx, &opts, "captureBeyondViewport") {
+            if let Some(b) = get_bool_prop(cx, &opts, "captureBeyondViewport")? {
                 capture_beyond_viewport = Some(b);
             }
-            if let Some(b) = get_bool_prop(cx, &opts, "fromSurface") {
+            if let Some(b) = get_bool_prop(cx, &opts, "fromSurface")? {
                 from_surface = Some(b);
             }
-            if let Some(b) = get_bool_prop(cx, &opts, "optimizeForSpeed") {
+            if let Some(b) = get_bool_prop(cx, &opts, "optimizeForSpeed")? {
                 optimize_for_speed = Some(b);
             }
+        }
+
+        if quality.is_some() && format == "png" {
+            return Err(cx.throw_range("`quality` applies only to the `jpeg` and `webp` formats"));
         }
 
         let client = get_page_client(cx, cc.this())?;
@@ -450,8 +485,16 @@ impl JSPage {
     /// `page.setViewport(width, height)`
     #[zq_method(name = "setViewport")]
     fn set_viewport<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let width = cc.arg_f64(cx, 0).map(|n| n as i32).unwrap_or(1280).max(1);
-        let height = cc.arg_f64(cx, 1).map(|n| n as i32).unwrap_or(720).max(1);
+        // Positive integers only: the old `as i32` silently clamped `-1` to 1,
+        // truncated `2.7` to 2 and saturated `1e12` to `i32::MAX`.
+        let width = args::in_range(cx, args::arg_i64(cx, &cc, 0, "width")?, "width", 1, 100_000)?;
+        let height = args::in_range(
+            cx,
+            args::arg_i64(cx, &cc, 1, "height")?,
+            "height",
+            1,
+            100_000,
+        )?;
         send_page_void_cmd(
             cx,
             &cc,
@@ -472,7 +515,7 @@ impl JSPage {
     /// a hash change or a link click could never satisfy it.
     #[zq_method(name = "waitForNavigation")]
     fn wait_for_navigation<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let timeout_ms = timeout_ms_or_default(cx, &cc, 0, 30_000).max(0) as u64;
+        let timeout_ms = timeout_ms_or_default(cx, &cc, 0, 30_000)? as u64;
 
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
@@ -520,12 +563,8 @@ impl JSPage {
     /// `page.handleDialog(accept, promptText?)`
     #[zq_method(name = "handleDialog")]
     fn handle_dialog<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let accept = cc.arg_bool(cx, 0).unwrap_or(false);
-        let prompt_text = if cc.len() > 1 && !cc.arg(1).is_undefined() {
-            cc.arg(1).try_string_read_utf8(cx)
-        } else {
-            None
-        };
+        let accept = args::arg_bool(cx, &cc, 0, "accept")?;
+        let prompt_text = args::opt_arg_string(cx, &cc, 1, "promptText")?;
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
@@ -552,19 +591,19 @@ impl JSPage {
     #[zq_method(name = "printToPDF")]
     fn print_to_pdf<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let mut params = serde_json::json!({ "printBackground": true });
-        if cc.len() > 0
+        if !cc.is_empty()
             && let Some(opts) = cc.arg(0).as_object()
         {
-            if let Some(v) = get_bool_prop(cx, &opts, "landscape") {
+            if let Some(v) = get_bool_prop(cx, &opts, "landscape")? {
                 params["landscape"] = serde_json::Value::Bool(v);
             }
-            if let Some(v) = get_number_prop(cx, &opts, "paperWidth") {
+            if let Some(v) = get_number_prop(cx, &opts, "paperWidth")? {
                 params["paperWidth"] = serde_json::json!(v);
             }
-            if let Some(v) = get_number_prop(cx, &opts, "paperHeight") {
+            if let Some(v) = get_number_prop(cx, &opts, "paperHeight")? {
                 params["paperHeight"] = serde_json::json!(v);
             }
-            if let Some(v) = get_bool_prop(cx, &opts, "printBackground") {
+            if let Some(v) = get_bool_prop(cx, &opts, "printBackground")? {
                 params["printBackground"] = serde_json::Value::Bool(v);
             }
         }
@@ -592,22 +631,16 @@ impl JSPage {
     /// `page.uploadFile(selector, filePaths)`
     #[zq_method(name = "uploadFile")]
     fn upload_file<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
-
-        let mut file_paths: Vec<String> = Vec::new();
-        if cc.len() > 1
-            && let Ok(Some(arr)) = cc.arg(1).as_array(cx)
-            && let Ok(len) = arr.length(cx)
-        {
-            for i in 0..len {
-                if let Some(s) = arr
-                    .get_index(cx, i as u32)
-                    .ok()
-                    .and_then(|x| x.try_string_read_utf8(cx))
-                {
-                    file_paths.push(s);
-                }
-            }
+        let selector = args::arg_string(cx, &cc, 0, "selector")?;
+        let arr = cc
+            .arg(1)
+            .as_array(cx)?
+            .ok_or_else(|| cx.throw_type("`filePaths` must be an array"))?;
+        let len = arr.length(cx)?;
+        let mut file_paths: Vec<String> = Vec::with_capacity(len);
+        for i in 0..len {
+            let item = arr.get_index(cx, i as u32)?;
+            file_paths.push(args::to_string(cx, item, &format!("filePaths[{i}]"))?);
         }
 
         let client = get_page_client(cx, cc.this())?;
@@ -650,7 +683,7 @@ impl JSPage {
     /// `page.addInitScript(source)`
     #[zq_method(name = "addInitScript")]
     fn add_init_script<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let source = cc.arg(0).coerce_string(cx).unwrap_or_default();
+        let source = args::arg_string(cx, &cc, 0, "source")?;
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
         cx.promise_fut_result(
@@ -734,7 +767,7 @@ impl JSPage {
     /// `page.setContent(html)`
     #[zq_method(name = "setContent")]
     fn set_content<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let html = cc.arg(0).coerce_string(cx).unwrap_or_default();
+        let html = args::arg_string(cx, &cc, 0, "html")?;
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
@@ -772,9 +805,9 @@ impl JSPage {
     #[zq_method]
     fn reload<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let mut params = serde_json::json!({});
-        if cc.len() > 0
+        if !cc.is_empty()
             && let Some(opts) = cc.arg(0).as_object()
-            && let Some(v) = get_bool_prop(cx, &opts, "ignoreCache")
+            && let Some(v) = get_bool_prop(cx, &opts, "ignoreCache")?
         {
             params["ignoreCache"] = serde_json::Value::Bool(v);
         }
@@ -827,9 +860,9 @@ impl JSPage {
     #[zq_method(name = "captureSnapshot")]
     fn capture_snapshot<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let mut params = serde_json::json!({ "format": "mhtml" });
-        if cc.len() > 0
+        if !cc.is_empty()
             && let Some(opts) = cc.arg(0).as_object()
-            && let Some(f) = get_str_prop(cx, &opts, "format")
+            && let Some(f) = get_str_prop(cx, &opts, "format")?
         {
             params["format"] = serde_json::Value::String(f);
         }
@@ -853,7 +886,7 @@ impl JSPage {
     /// `page.setBypassCSP(enabled)`
     #[zq_method(name = "setBypassCSP")]
     fn set_bypass_csp<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let enabled = cc.arg_bool(cx, 0).unwrap_or(false);
+        let enabled = args::arg_bool(cx, &cc, 0, "enabled")?;
         send_page_void_cmd(
             cx,
             &cc,
@@ -861,8 +894,6 @@ impl JSPage {
             Some(serde_json::json!({ "enabled": enabled })),
         )
     }
-
-    // 鈹€鈹€ Input domain 鈹€鈹€
 
     #[zq_method(name = "mouseClick")]
     fn mouse_click<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -1236,52 +1267,66 @@ pub(crate) fn send_page_void_cmd<'a>(
 // Utility helpers
 // ---------------------------------------------------------------------------
 
-/// Optional-property readers. Each swallows the exception a throwing getter or
-/// a wrong-typed value leaves behind (`ZqValue::try_get_*`), because "not
-/// provided" is a normal answer for an options bag and must not survive the call.
+/// Optional-property readers. `undefined` means "not provided"; a present value
+/// of the wrong type throws (naming the key), per the strict argument policy in
+/// [`crate::args`]. `null` is a value, not a default, and is rejected too.
 ///
 /// The one-line aliases stay because they read better at the ~60 call sites than
-/// `opts.try_get_string_str(cx, "format")`.
-pub(crate) fn get_str_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Option<String> {
-    obj.try_get_string_str(cx, key)
+/// `args::opt_string_prop(cx, &opts, "format")`.
+pub(crate) fn get_str_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Result<Option<String>, ZqError> {
+    args::opt_string_prop(cx, obj, key)
 }
 
-pub(crate) fn get_number_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Option<f64> {
-    obj.try_get_f64_str(cx, key)
+pub(crate) fn get_number_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Result<Option<f64>, ZqError> {
+    args::opt_f64_prop(cx, obj, key)
 }
 
-pub(crate) fn get_bool_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Option<bool> {
-    obj.try_get_bool_str(cx, key)
+pub(crate) fn get_i64_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Result<Option<i64>, ZqError> {
+    args::opt_i64_prop(cx, obj, key)
 }
 
-/// Optional nested object property; `None` when absent, nullish or not an object.
+pub(crate) fn get_bool_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Result<Option<bool>, ZqError> {
+    args::opt_bool_prop(cx, obj, key)
+}
+
+/// Optional nested object property; a non-object value throws.
 pub(crate) fn get_object_prop<'a>(
     cx: ZqCtx<'a>,
     obj: &ZqValue<'a>,
     key: &str,
-) -> Option<ZqValue<'a>> {
-    obj.try_get_object_str(cx, key)
+) -> Result<Option<ZqValue<'a>>, ZqError> {
+    args::opt_object_prop(cx, obj, key)
 }
 
-/// Optional nested array property; `None` when absent, nullish or not an array.
+/// Optional nested array property; a non-array value throws.
 pub(crate) fn get_array_prop<'a>(
     cx: ZqCtx<'a>,
     obj: &ZqValue<'a>,
     key: &str,
-) -> Option<ZqValue<'a>> {
-    obj.try_get_array_str(cx, key)
+) -> Result<Option<ZqValue<'a>>, ZqError> {
+    args::opt_array_prop(cx, obj, key)
 }
 
-/// Optional enum-valued property, validated against `allowed` (`None` when
-/// absent). Throws a `RangeError` naming the property, the rejected value and
-/// the full set when the value is not a member.
+/// Optional enum-valued string property, validated against `allowed` (`None`
+/// when absent). A wrong type throws a `TypeError`; an unknown value throws a
+/// `RangeError` naming the property, the rejected value and the full set.
 pub(crate) fn get_enum_prop(
     cx: ZqCtx,
     obj: &ZqValue,
     key: &str,
     allowed: &[&str],
 ) -> Result<Option<String>, ZqError> {
-    obj.get_enum(cx, key, allowed)
+    let Some(v) = args::opt_string_prop(cx, obj, key)? else {
+        return Ok(None);
+    };
+    if allowed.contains(&v.as_str()) {
+        Ok(Some(v))
+    } else {
+        Err(cx.throw_range(&format!(
+            "`{key}` must be one of {}; got {v:?}",
+            allowed.join("|")
+        )))
+    }
 }
 
 /// True for the one `waitForSelector` failure that waiting cannot fix: the
@@ -1297,17 +1342,21 @@ fn is_bad_selector(message: &str) -> bool {
 
 /// Resolve an optional `timeoutMs` argument.
 ///
-/// A missing argument, an explicit `undefined`, and anything `ToNumber` cannot
-/// produce a finite number from all mean "use the default". Reading them through
-/// `as i64` instead turned both `undefined` (NaN) and a typo into `0`, i.e. an
-/// immediate timeout 鈥?and `waitForNavigation(undefined)` landed on `0.max(1000)`
-/// rather than the documented 30000.
-fn timeout_ms_or_default(cx: ZqCtx, cc: &ZqCallInfo, nth: usize, default: i64) -> i64 {
-    cc.arg_f64(cx, nth)
-        .ok()
-        .filter(|n| n.is_finite())
-        .map(|n| n as i64)
-        .unwrap_or(default)
+/// Only an omitted (`undefined`) argument means "use the default"; anything else
+/// must be a non-negative integer. The old `ToNumber`-then-`as i64` path turned
+/// `undefined` (NaN) and a typo alike into `0`, i.e. an immediate timeout, and
+/// `waitForNavigation(undefined)` landed on `0.max(1000)` rather than the
+/// documented 30000.
+fn timeout_ms_or_default(
+    cx: ZqCtx,
+    cc: &ZqCallInfo,
+    nth: usize,
+    default: i64,
+) -> Result<i64, ZqError> {
+    match args::opt_arg_i64(cx, cc, nth, "timeoutMs")? {
+        Some(n) => args::in_range(cx, n, "timeoutMs", 0, i64::MAX),
+        None => Ok(default),
+    }
 }
 
 /// Shared helper for `back()` / `forward()`: step `delta` entries through the

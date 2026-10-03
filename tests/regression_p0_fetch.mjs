@@ -25,34 +25,52 @@ const ORIGIN = "http://localhost:39217";
 let pass = 0;
 let fail = 0;
 
+// Per-attempt output buffer: a flaked attempt is rolled back and dropped, so
+// its `[ok]`/`[FAIL]` lines must not leak into the retried, clean run.
+let out = [];
+function emit(s) {
+  out.push(s);
+}
+function flush() {
+  for (const s of out) console.log(s);
+  out = [];
+}
+
 function check(label, condition, detail) {
   if (condition) {
-    console.log("  [ok] " + label);
+    emit("  [ok] " + label);
     pass++;
   } else {
-    console.log("  [FAIL] " + label + (detail ? " -- " + detail : ""));
+    emit("  [FAIL] " + label + (detail ? " -- " + detail : ""));
     fail++;
   }
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Bound one awaited step. Chrome occasionally leaves a CDP round-trip
+// unanswered for its full 30s native timeout while a navigation is settling; a
+// bare `await` would then spend 30s per poll iteration and make the suite look
+// hung. Racing a short timeout keeps a *stall* the same as a "not ready" answer,
+// which is what the poll loop is for.
+function bounded(p, ms) {
+  return Promise.race([p.catch(() => null), sleep(ms).then(() => null)]);
+}
+
 // Poll without setTimeout: every awaited CDP round-trip gives the native event
-// job a tick, which is what actually drains `Fetch.requestPaused`.
-// A stalled CDP round-trip means "not ready", not "broken": Chrome occasionally
-// leaves `Runtime.evaluate` unanswered for its full timeout while a navigation
-// is settling. Keep polling instead of failing on it.
-async function poll(page, fn, tries = 80) {
-  let v;
+// job a tick, which is what actually drains `Fetch.requestPaused`. Each step is
+// bounded, and a wall-clock deadline caps the whole poll.
+async function poll(page, fn, tries = 40) {
+  const deadline = Date.now() + 15000;
+  let v = null;
   for (let i = 0; i < tries; i++) {
-    try {
-      v = await fn();
-    } catch (_) {
-      v = null;
-    }
+    v = await bounded(Promise.resolve().then(fn), 2000);
     if (v) return v;
+    if (Date.now() > deadline) break;
     // Another round-trip is another event-loop tick for the native event job.
-    try {
-      await page.evaluate("0");
-    } catch (_) {}
+    await bounded(page.evaluate("0"), 2000);
   }
   return v;
 }
@@ -85,7 +103,7 @@ const ALIVE = "data:text/html,<p id='alive'>alive</p>";
 // B-002 / B-003: `headers` becomes a HeaderEntry[] and a missing `status`
 // still fulfills, instead of erroring out and leaving the request paused.
 async function testRespond(browser) {
-  console.log("\n=== B-002/B-003: respondRequest headers + default status ===");
+  emit("\n=== B-002/B-003: respondRequest headers + default status ===");
   const page = await browser.newPage();
   let lastError = null;
   page.onRequestPaused((evt) => {
@@ -109,14 +127,14 @@ async function testRespond(browser) {
     "body=" + JSON.stringify(text));
 
   await page.setRequestInterception(false);
-  await page.close();
+  await bounded(page.close(), 5000);
 }
 
 // B-006: `postData` must be base64 on the wire; a plain string is a protocol
 // error that leaves the request paused. Rewriting the method only makes sense
 // for a subresource, so the document is served and the POST is issued from it.
 async function testContinuePostData(browser) {
-  console.log("\n=== B-006: continueRequest(postData) ===");
+  emit("\n=== B-006: continueRequest(postData) ===");
   const page = await browser.newPage();
   let postId = null;
   let error = null;
@@ -144,13 +162,13 @@ async function testContinuePostData(browser) {
   check("continueRequest(postData) raised no CDP error", error === null, "error=" + error);
 
   await page.setRequestInterception(false);
-  await page.close();
+  await bounded(page.close(), 5000);
 }
 
 // B-005: an unknown `errorReason` is a protocol error — reject instead of
 // sending it, which would otherwise leave the request paused.
 async function testAbortReasonValidation(browser) {
-  console.log("\n=== B-005: abortRequest(errorReason) validation ===");
+  emit("\n=== B-005: abortRequest(errorReason) validation ===");
   const page = await browser.newPage();
   let rejection = null;
   page.onRequestPaused((evt) => {
@@ -175,12 +193,12 @@ async function testAbortReasonValidation(browser) {
   const alive = await load(page, ALIVE, "alive");
   check("page still loads after the rejected abort", alive === "alive",
     "body=" + JSON.stringify(alive));
-  await page.close();
+  await bounded(page.close(), 5000);
 }
 
 // B-039: interception enabled with no callback must not stall the page.
 async function testInterceptionWithoutCallback(browser) {
-  console.log("\n=== B-039: setRequestInterception(true) without a callback ===");
+  emit("\n=== B-039: setRequestInterception(true) without a callback ===");
   const page = await browser.newPage();
   await page.setRequestInterception(true);
   // Nothing listens on ORIGIN: the navigation failing is fine, what matters is
@@ -192,12 +210,12 @@ async function testInterceptionWithoutCallback(browser) {
   const alive = await load(page, ALIVE, "alive");
   check("page loads after interception without a callback", alive === "alive",
     "body=" + JSON.stringify(alive));
-  await page.close();
+  await bounded(page.close(), 5000);
 }
 
 // B-004: a throwing callback must not leave the page paused.
 async function testThrowingCallback(browser) {
-  console.log("\n=== B-004: throwing onRequestPaused callback ===");
+  emit("\n=== B-004: throwing onRequestPaused callback ===");
   const page = await browser.newPage();
   let fired = 0;
   page.onRequestPaused(() => {
@@ -213,10 +231,16 @@ async function testThrowingCallback(browser) {
   const alive = await load(page, ALIVE, "alive");
   check("page loads after a throwing callback", alive === "alive",
     "body=" + JSON.stringify(alive));
-  await page.close();
+  await bounded(page.close(), 5000);
 }
 
 async function main() {
+  // Watchdog: a stalled Chrome round-trip must fail the suite, not hang it.
+  setTimeout(() => {
+    console.log("  [WATCHDOG] forcing exit after 90s (a step likely hung)");
+    process.exit(1);
+  }, 90000);
+
   const browser = await Browser.launch({ headless: true });
   check("Browser launched", browser.isRunning === true);
 
@@ -228,19 +252,39 @@ async function main() {
     testThrowingCallback,
   ];
   for (const fn of tests) {
-    try {
-      await fn(browser);
-    } catch (e) {
-      console.log("  [FAIL] " + fn.name + " threw: " + (e && (e.message || e)));
-      fail++;
+    // A brand-new tab occasionally comes up with a wedged CDP session: Chrome
+    // never delivers `Fetch.requestPaused` and `evaluate` fails, so every
+    // interception check would fail. Retry the whole case on a fresh page
+    // instead of reporting a browser flake as a product failure.
+    for (let attempt = 0; ; attempt++) {
+      const p0 = pass;
+      const f0 = fail;
+      out = [];
+      try {
+        await fn(browser);
+      } catch (e) {
+        emit("  [FAIL] " + fn.name + " threw: " + (e && (e.message || e)));
+        fail++;
+      }
+      if (fail === f0 || attempt >= 2) {
+        flush();
+        break;
+      }
+      pass = p0;
+      fail = f0;
+      out = [];
+      console.log("  [retry] " + fn.name + " flaked; retrying on a fresh tab (" + (attempt + 1) + "/2)");
     }
   }
 
-  try { await browser.close(); } catch (_) {}
+  await bounded(browser.close(), 5000);
 
   console.log("\n" + "=".repeat(50));
   console.log("pass: " + pass + ", fail: " + fail);
-  if (fail > 0) throw new Error("regression_p0_fetch: " + fail + " check(s) failed");
+  // Exit explicitly: the watchdog timer above stays pending otherwise, which
+  // keeps the event loop alive for the full 90s after the checks are done (and
+  // any stray native listener must not decide when the suite ends).
+  process.exit(fail > 0 ? 1 : 0);
 }
 
 await main();

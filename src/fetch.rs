@@ -8,11 +8,12 @@ use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
 use crate::{
-    Listener,
+    Listener, args,
     cdp::CdpClient,
     cdp_network,
     class_page::{
-        get_number_prop, get_page_client, get_page_session, get_str_prop, send_page_void_cmd,
+        get_i64_prop, get_object_prop, get_page_client, get_page_session, get_str_prop,
+        send_page_void_cmd,
     },
     helpers, require_callback, with_state,
 };
@@ -43,20 +44,10 @@ fn all_patterns() -> serde_json::Value {
 /// Convert a JS `Record<string,string>` into the `Fetch.HeaderEntry[]` the
 /// protocol requires (an array of `{name, value}`, not an object).
 fn headers_to_json(cx: ZqCtx, obj: &ZqValue) -> Result<serde_json::Value, ZqError> {
-    let Some(serde_json::Value::Object(map)) = obj.to_json(cx) else {
-        return Ok(serde_json::Value::Array(Vec::new()));
-    };
+    let map = args::string_map(cx, obj, "headers")?;
     Ok(serde_json::Value::Array(
         map.into_iter()
-            .map(|(name, value)| {
-                serde_json::json!({
-                    "name": name,
-                    "value": match value {
-                        serde_json::Value::String(s) => s,
-                        other => other.to_string(),
-                    },
-                })
-            })
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
             .collect(),
     ))
 }
@@ -66,11 +57,17 @@ pub(crate) fn js_page_set_request_interception<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let enabled = cc.arg_bool(cx, 0).unwrap_or(false);
+    let enabled = args::arg_bool(cx, &cc, 0, "enabled")?;
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
 
     if enabled {
+        // Subscribe *before* `Fetch.enable` is sent. A receiver created only
+        // inside the forwarding task races the enable: a request already in
+        // flight can be paused and its `Fetch.requestPaused` broadcast before
+        // the task is scheduled, and a broadcast with no live receiver drops
+        // the event — that request then stays paused and its page never loads.
+        let event_rx = client.subscribe_events();
         let resume_client = client.clone();
         let tx = cx.spawn_event_job("fetch", move |cx, msg: serde_json::Value| {
             let sess = msg
@@ -108,10 +105,12 @@ pub(crate) fn js_page_set_request_interception<'a>(
         let client_ev = client.clone();
         let session_ev = session_id.clone();
         let task = helpers::spawn(async move {
+            // `event_rx` was subscribed synchronously above, before
+            // `Fetch.enable`, so nothing paused in between can be missed.
+            let mut event_rx = event_rx;
             // Enabling Network up-front ensures request bodies are tracked, so
             // `Network.getRequestPostData` can read them later.
             let _ = cdp_network::enable_network(&client_ev, &session_ev).await;
-            let mut event_rx = client_ev.subscribe_events();
             loop {
                 match event_rx.recv().await {
                     Ok(evt) if evt.shutdown => break,
@@ -178,7 +177,7 @@ pub(crate) fn js_page_continue_request<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let req_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let req_id = args::arg_string(cx, &cc, 0, "interceptionId")?;
     let session_id = get_page_session(cx, cc.this())?;
     mark_handled(cx, &session_id, &req_id);
 
@@ -186,16 +185,16 @@ pub(crate) fn js_page_continue_request<'a>(
     if cc.len() > 1
         && let Some(obj) = cc.arg(1).as_object()
     {
-        if let Some(u) = get_str_prop(cx, &obj, "url") {
+        if let Some(u) = get_str_prop(cx, &obj, "url")? {
             params["url"] = serde_json::Value::String(u);
         }
-        if let Some(m) = get_str_prop(cx, &obj, "method") {
+        if let Some(m) = get_str_prop(cx, &obj, "method")? {
             params["method"] = serde_json::Value::String(m);
         }
-        if let Some(h) = crate::class_page::get_object_prop(cx, &obj, "headers") {
+        if let Some(h) = get_object_prop(cx, &obj, "headers")? {
             params["headers"] = headers_to_json(cx, &h)?;
         }
-        if let Some(p) = get_str_prop(cx, &obj, "postData") {
+        if let Some(p) = get_str_prop(cx, &obj, "postData")? {
             // `Fetch.Request.postData` is a binary::String.
             params["postData"] = serde_json::Value::String(
                 base64::engine::general_purpose::STANDARD.encode(p.as_bytes()),
@@ -210,7 +209,7 @@ pub(crate) fn js_page_abort_request<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let req_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let req_id = args::arg_string(cx, &cc, 0, "interceptionId")?;
     // An unknown reason is a protocol error, and the request would be left
     // paused forever, so reject before sending. Both the bare-string and the
     // `{ reason }` spellings are accepted.
@@ -236,7 +235,7 @@ pub(crate) fn js_page_respond_request<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let req_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let req_id = args::arg_string(cx, &cc, 0, "interceptionId")?;
     let session_id = get_page_session(cx, cc.this())?;
     mark_handled(cx, &session_id, &req_id);
 
@@ -244,17 +243,18 @@ pub(crate) fn js_page_respond_request<'a>(
     if cc.len() > 1
         && let Some(obj) = cc.arg(1).as_object()
     {
-        if let Some(code) = get_number_prop(cx, &obj, "status") {
-            params["responseCode"] = serde_json::json!(code as i32);
+        if let Some(code) = get_i64_prop(cx, &obj, "status")? {
+            params["responseCode"] =
+                serde_json::json!(args::in_range(cx, code, "status", 100, 599)?);
         }
-        if let Some(h) = crate::class_page::get_object_prop(cx, &obj, "headers") {
+        if let Some(h) = get_object_prop(cx, &obj, "headers")? {
             params["responseHeaders"] = headers_to_json(cx, &h)?;
         }
-        if let Some(body) = get_str_prop(cx, &obj, "body") {
+        if let Some(body) = get_str_prop(cx, &obj, "body")? {
             let b64 = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
             params["body"] = serde_json::Value::String(b64);
         }
-        if let Some(ct) = get_str_prop(cx, &obj, "contentType")
+        if let Some(ct) = get_str_prop(cx, &obj, "contentType")?
             && params.get("responseHeaders").is_none()
         {
             params["responseHeaders"] =

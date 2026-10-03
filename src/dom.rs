@@ -5,7 +5,7 @@
 
 use zuqe_zapi::*;
 
-use crate::{cdp::CdpClient, cdp_input, class_page::get_page_payload};
+use crate::{args, cdp::CdpClient, cdp_input, class_page::get_page_payload};
 
 /// Enable the DOM domain and resolve a CSS selector to a `nodeId`.
 pub(crate) async fn resolve_selector(
@@ -52,7 +52,7 @@ pub(crate) fn js_page_query_selector<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_result(
         async move { resolve_selector(&client, &session_id, &selector).await },
@@ -65,7 +65,7 @@ pub(crate) fn js_page_query_selector_all<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_result(
         async move {
@@ -106,8 +106,8 @@ pub(crate) fn js_page_get_attribute<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
-    let name = cc.arg(1).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
+    let name = args::arg_string(cx, &cc, 1, "name")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_json(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
@@ -136,7 +136,7 @@ pub(crate) fn js_page_get_attribute<'a>(
 
 /// `page.focus(selector)`
 pub(crate) fn js_page_focus<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_void(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
@@ -156,7 +156,7 @@ pub(crate) fn js_page_get_box_model<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_json(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
@@ -176,7 +176,7 @@ pub(crate) fn js_page_remove<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_void(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
@@ -248,7 +248,7 @@ fn quad_center(model: Option<&serde_json::Value>) -> Result<(f64, f64), String> 
 
 /// `page.click(selector)`
 pub(crate) fn js_page_click<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_void(async move {
         let (cxp, cyp) = content_center(&client, &session_id, &selector).await?;
@@ -258,8 +258,8 @@ pub(crate) fn js_page_click<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqV
 
 /// `page.type(selector, text)`
 pub(crate) fn js_page_type<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
-    let text = cc.arg(1).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
+    let text = args::arg_string(cx, &cc, 1, "text")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_void(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
@@ -411,7 +411,13 @@ pub(crate) fn js_page_click_backend_node<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let backend_node_id = cc.arg_f64(cx, 0).map(|n| n as u64).unwrap_or(0);
+    // A backend node id is a positive integer: `NaN as u64` used to yield 0,
+    // a negative value wrapped to `u64::MAX`, and a fraction was truncated.
+    let backend_node_id = args::arg_i64(cx, &cc, 0, "backendNodeId")?;
+    if backend_node_id <= 0 {
+        return Err(cx.throw_range("`backendNodeId` must be a positive integer"));
+    }
+    let backend_node_id = backend_node_id as u64;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_void(async move {
         let (cxp, cyp) = backend_center(&client, &session_id, backend_node_id).await?;
@@ -424,8 +430,14 @@ pub(crate) fn js_page_type_backend_node<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let backend_node_id = cc.arg_f64(cx, 0).map(|n| n as u64).unwrap_or(0);
-    let text = cc.arg(1).coerce_string(cx).unwrap_or_default();
+    // A backend node id is a positive integer: `NaN as u64` used to yield 0,
+    // a negative value wrapped to `u64::MAX`, and a fraction was truncated.
+    let backend_node_id = args::arg_i64(cx, &cc, 0, "backendNodeId")?;
+    if backend_node_id <= 0 {
+        return Err(cx.throw_range("`backendNodeId` must be a positive integer"));
+    }
+    let backend_node_id = backend_node_id as u64;
+    let text = args::arg_string(cx, &cc, 1, "text")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_void(async move {
         let _ = client.send("DOM.enable", None, Some(&session_id)).await;
@@ -445,7 +457,7 @@ pub(crate) fn js_page_get_node_value<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
+    let selector = args::arg_string(cx, &cc, 0, "selector")?;
     let (client, session_id) = page(cx, cc.this())?;
     cx.promise_fut_string(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
