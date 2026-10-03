@@ -134,6 +134,9 @@ impl CdpClient {
         let bg_writer = writer.clone();
         let bg_event_tx = event_tx.clone();
         let bg_pending = pending.clone();
+        // The loop keeps a sender so that `is_closed()` turns true when it
+        // stops for any reason, not only on an explicit `disconnect()`.
+        let bg_shutdown_tx = shutdown_tx.clone();
         let handle = tokio::spawn(async move {
             Self::run_background(
                 bg_writer,
@@ -142,6 +145,7 @@ impl CdpClient {
                 bg_event_tx,
                 bg_pending,
                 shutdown_rx,
+                bg_shutdown_tx,
             )
             .await;
         });
@@ -235,6 +239,7 @@ impl CdpClient {
         event_tx: broadcast::Sender<CdpEvent>,
         pending: Pending,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
     ) {
         let pending_r = pending.clone();
         let event_tx_r = event_tx.clone();
@@ -311,6 +316,10 @@ impl CdpClient {
         for (_, (method, tx)) in pending.lock().unwrap().drain() {
             let _ = tx.send(Err(format!("CDP `{method}`: {reason}")));
         }
+
+        // Flip the client's own closed flag as well, so `is_closed()` also
+        // reports a connection that died on its own (not only `disconnect()`).
+        let _ = shutdown_tx.send(true);
     }
 
     /// Write one command over the socket.

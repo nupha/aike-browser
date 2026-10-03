@@ -39,6 +39,10 @@ pub(crate) struct BrowserPayload {
     /// Cleared by `close()`. Attach mode owns no process, so this is what
     /// `isRunning` can honestly report there.
     pub(crate) closed: Arc<AtomicBool>,
+    /// `true` for `launch()` (owns the child), `false` for `connect()` (attach
+    /// mode). `isRunning` needs this to tell "the child has been reaped" from
+    /// "there never was a child", which are both `chrome_child == None`.
+    pub(crate) owns_process: bool,
 }
 
 // No GC-managed JS values in the payload.
@@ -302,14 +306,20 @@ impl JSBrowser {
         if payload.closed.load(Ordering::SeqCst) || payload.client.is_closed() {
             return Ok(ZqValue::bool(false));
         }
+        if !payload.owns_process {
+            // Attach mode owns no child; an open connection is the only
+            // liveness answer (the `close()` / `is_closed()` checks above
+            // already ruled out a dead one).
+            return Ok(ZqValue::bool(true));
+        }
         // Contended means another caller is mid-reap, so the child is still
         // there: answering `false` would report a live browser as dead.
-        let owns_process = payload
+        let child_present = payload
             .chrome_child
             .try_lock()
             .map(|g| g.is_some())
             .unwrap_or(true);
-        Ok(ZqValue::bool(owns_process))
+        Ok(ZqValue::bool(child_present))
     }
 
     /// `browser.getVersion()`
@@ -516,6 +526,9 @@ fn browser_promise<'a>(cx: ZqCtx<'a>, req: LaunchRequest) -> Result<ZqValue<'a>,
             }
         },
         |cx, (client, child, user_data_dir)| {
+            // `child` is `Some` only for `launch()`; `connect()` attaches with
+            // no process of its own.
+            let owns_process = child.is_some();
             JSBrowser::new_instance(
                 cx,
                 BrowserPayload {
@@ -523,6 +536,7 @@ fn browser_promise<'a>(cx: ZqCtx<'a>, req: LaunchRequest) -> Result<ZqValue<'a>,
                     chrome_child: Arc::new(tokio::sync::Mutex::new(child)),
                     user_data_dir,
                     closed: Arc::new(AtomicBool::new(false)),
+                    owns_process,
                 },
             )
         },
