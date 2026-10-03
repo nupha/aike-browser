@@ -153,6 +153,12 @@ pub(crate) fn js_page_key_press<'a>(
 }
 
 /// `page.dragAndDrop(sourceSelector, targetSelector)`
+///
+/// The press / masked move / explicit drop sequence below is what actually
+/// makes HTML5 drag-and-drop fire. Moving without the `buttons` mask told the
+/// renderer no button was held, so it cancelled the drag: the page saw no
+/// `dragstart`, `dragover` or `drop` at all. Verified against Chrome 153 —
+/// `mousedown, dragstart, dragenter, dragover, drop, dragend, mouseup`.
 pub(crate) fn js_page_drag_and_drop<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
@@ -167,11 +173,16 @@ pub(crate) fn js_page_drag_and_drop<'a>(
         let (tx, ty) = box_center(&client, &session_id, &target).await?;
         cdp_input::mouse_move(&client, &session_id, sx, sy).await?;
         cdp_input::mouse_down(&client, &session_id, sx, sy, "left", 1).await?;
-        cdp_input::mouse_move(&client, &session_id, (sx + tx) / 2.0, (sy + ty) / 2.0).await?;
-        cdp_input::mouse_move(&client, &session_id, tx, ty).await?;
+        cdp_input::mouse_move_dragging(&client, &session_id, tx, ty, LEFT_BUTTON_MASK).await?;
+        // The drop is dispatched explicitly rather than inferred from the
+        // release; a release alone leaves the gesture to the renderer.
+        cdp_input::drag_event(&client, &session_id, "drop", tx, ty).await?;
         cdp_input::mouse_up(&client, &session_id, tx, ty, "left", 1).await
     })
 }
+
+/// `Input.dispatchMouseEvent.buttons` bit for the left button.
+const LEFT_BUTTON_MASK: i32 = 1;
 
 /// `page.insertText(text)`
 pub(crate) fn js_page_insert_text<'a>(

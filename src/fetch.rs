@@ -8,6 +8,7 @@ use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
 use crate::{
+    Listener,
     cdp::CdpClient,
     cdp_network,
     class_page::{
@@ -106,13 +107,14 @@ pub(crate) fn js_page_set_request_interception<'a>(
 
         let client_ev = client.clone();
         let session_ev = session_id.clone();
-        helpers::spawn(async move {
+        let task = helpers::spawn(async move {
             // Enabling Network up-front ensures request bodies are tracked, so
             // `Network.getRequestPostData` can read them later.
             let _ = cdp_network::enable_network(&client_ev, &session_ev).await;
             let mut event_rx = client_ev.subscribe_events();
             loop {
                 match event_rx.recv().await {
+                    Ok(evt) if evt.shutdown => break,
                     Ok(evt)
                         if evt.method == "Fetch.requestPaused"
                             && evt.session_id.as_deref() == Some(&session_ev) =>
@@ -137,11 +139,20 @@ pub(crate) fn js_page_set_request_interception<'a>(
             }
         });
 
+        // Re-enabling replaces the forwarding task instead of stacking a second
+        // one, which would resume each paused request from two event jobs.
+        with_state(cx, |st| {
+            st.set_listener_task(Listener::Fetch, &session_id, task)
+        });
+
         // Resolve once Fetch.enable has been issued.
         send_page_void_cmd(cx, &cc, "Fetch.enable", Some(all_patterns()))
     } else {
         with_state(cx, |st| {
             st.fetch_callbacks.remove(&session_id);
+            // Stop forwarding: the task outlived `setRequestInterception(false)`
+            // before, so every on/off cycle leaked one.
+            st.clear_listener_task(Listener::Fetch, &session_id);
         });
         send_page_void_cmd(cx, &cc, "Fetch.disable", None)
     }

@@ -6,7 +6,10 @@
 //! Holds the CDP `CdpClient` (browser-level, no session) and the handle to the
 //! spawned Chrome child process. All `Browser.*` methods are defined here.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use zuqe_zapi::ffi::{ZQ_PROP_CONFIGURABLE, ZQ_PROP_ENUMERABLE, ZQ_PROP_WRITABLE};
 use zuqe_zapi::*;
@@ -15,8 +18,8 @@ use zuqe_zapi_macros::{zq_class, zq_class_impl, zq_method, zq_static_method};
 use crate::{
     cdp, chrome,
     class_page::{
-        JSPage, PageNetworkState, PagePayload, get_array_prop, get_bool_prop, get_enum_prop,
-        get_number_prop, get_str_prop,
+        JSPage, get_array_prop, get_bool_prop, get_enum_prop, get_number_prop, get_str_prop,
+        new_page_payload,
     },
 };
 
@@ -33,6 +36,9 @@ pub(crate) struct BrowserPayload {
     pub(crate) chrome_child: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
     /// Auto-created Chrome profile dir, removed once the child is reaped.
     pub(crate) user_data_dir: Option<std::path::PathBuf>,
+    /// Cleared by `close()`. Attach mode owns no process, so this is what
+    /// `isRunning` can honestly report there.
+    pub(crate) closed: Arc<AtomicBool>,
 }
 
 // No GC-managed JS values in the payload.
@@ -133,11 +139,14 @@ impl JSBrowser {
                     false,
                 )
                 .await?;
+                // `Child::id()` is only available while the child is unwaited,
+                // and the slot is contended during any kill; capture it now.
+                let pid = s.child.id().unwrap_or(0);
                 let handle: ChildArcSlot = Arc::new(tokio::sync::Mutex::new(Some(s.child)));
                 chrome::register_spawned_child(&handle);
-                Ok((s.bin, s.cdp_url, handle, s.user_data_dir))
+                Ok((s.bin, s.cdp_url, handle, s.user_data_dir, pid))
             },
-            |cx, (bin, cdp_url, child, user_data_dir)| {
+            |cx, (bin, cdp_url, child, user_data_dir, pid)| {
                 JSBrowserProcess::new_instance(
                     cx,
                     BrowserProcessPayload {
@@ -145,6 +154,8 @@ impl JSBrowser {
                         bin,
                         cdp_url,
                         user_data_dir,
+                        pid,
+                        killed: Arc::new(AtomicBool::new(false)),
                     },
                 )
             },
@@ -205,12 +216,7 @@ impl JSBrowser {
             move |cx, (target_id, session_id)| {
                 let page = JSPage::new_instance(
                     cx,
-                    PagePayload {
-                        client: client_cb.clone(),
-                        session_id,
-                        target_id: target_id.clone(),
-                        network: PageNetworkState::new(),
-                    },
+                    new_page_payload(client_cb.clone(), session_id, target_id.clone()),
                 )?;
                 // `targetId` own property (readonly in the d.ts; kept writable
                 // here so the native install always wins).
@@ -227,25 +233,32 @@ impl JSBrowser {
     }
 
     /// `browser.close()`
+    ///
+    /// Owning mode: ask Chrome to exit, then reap it and delete its profile
+    /// dir. Attach mode: just disconnect — the external process is not ours to
+    /// kill, but the WebSocket and its reader task must still go.
     #[zq_method]
     fn close<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let payload = get_browser_payload(cx, cc.this())?;
         let client = payload.client.clone();
         let chrome_child = payload.chrome_child.clone();
         let user_data_dir = payload.user_data_dir.clone();
+        let closed = payload.closed.clone();
         cx.promise_fut_result(
             async move {
-                // Attach mode (no child process): don't send `Browser.close`.
-                let owns_process = chrome_child
-                    .try_lock()
-                    .map(|g| g.is_some())
-                    .unwrap_or(false);
+                // `lock().await`, never `try_lock()`: losing the race used to
+                // skip the reap *and* the profile-dir cleanup, silently leaking
+                // a Chrome process and its directory.
+                let owns_process = chrome_child.lock().await.is_some();
                 if owns_process {
-                    let _ = client.send("Browser.close", None, None).await;
+                    // Chrome usually drops the connection before answering
+                    // `Browser.close`, so a failure here is expected rather than
+                    // exceptional — but it must not be invisible either.
+                    if let Err(e) = client.send("Browser.close", None, None).await {
+                        log::warn!("Browser.close did not acknowledge: {e}");
+                    }
                 }
-                if let Ok(mut guard) = chrome_child.try_lock()
-                    && let Some(mut child) = guard.take()
-                {
+                if let Some(mut child) = chrome_child.lock().await.take() {
                     // On Windows, `Browser.close` and child.start_kill() are
                     // asynchronous; wait for actual exit before removing the
                     // user-data-dir, otherwise Chrome would rewrite files in
@@ -257,6 +270,11 @@ impl JSBrowser {
                         None => chrome::kill_and_reap(&mut child, CLOSE_TIMEOUT).await,
                     }
                 }
+                // Tear the connection down in both modes: without this, attach
+                // mode left the socket and its reader task alive for the rest
+                // of the process lifetime.
+                client.disconnect();
+                closed.store(true, Ordering::SeqCst);
                 Ok(())
             },
             |_cx, ()| Ok(ZqValue::undefined()),
@@ -264,15 +282,24 @@ impl JSBrowser {
     }
 
     /// `browser.isRunning` getter
+    ///
+    /// Owning mode reports the child process. Attach mode owns no process, so
+    /// there it reports whether this `Browser` still holds an open CDP
+    /// connection — the only liveness answerable without a round trip.
     #[zq_method(name = "isRunning", get)]
     fn is_running<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let payload = get_browser_payload(cx, cc.this())?;
-        let running = payload
+        if payload.closed.load(Ordering::SeqCst) || payload.client.is_closed() {
+            return Ok(ZqValue::bool(false));
+        }
+        // Contended means another caller is mid-reap, so the child is still
+        // there: answering `false` would report a live browser as dead.
+        let owns_process = payload
             .chrome_child
             .try_lock()
             .map(|g| g.is_some())
-            .unwrap_or(false);
-        Ok(ZqValue::bool(running))
+            .unwrap_or(true);
+        Ok(ZqValue::bool(owns_process))
     }
 
     /// `browser.getVersion()`
@@ -482,6 +509,7 @@ fn browser_promise<'a>(cx: ZqCtx<'a>, req: LaunchRequest) -> Result<ZqValue<'a>,
                     client,
                     chrome_child: Arc::new(tokio::sync::Mutex::new(child)),
                     user_data_dir,
+                    closed: Arc::new(AtomicBool::new(false)),
                 },
             )
         },
@@ -504,6 +532,12 @@ pub(crate) struct BrowserProcessPayload {
     pub(crate) cdp_url: String,
     /// Auto-created Chrome profile dir, removed once the child is reaped.
     pub(crate) user_data_dir: Option<std::path::PathBuf>,
+    /// Pid captured at spawn. Read from the live `Child` it could only be
+    /// reported while nothing else held the lock, so `pid` read back `null` on
+    /// a perfectly healthy process.
+    pub(crate) pid: u32,
+    /// Set by `kill()`; `pid` reports `null` afterwards.
+    pub(crate) killed: Arc<AtomicBool>,
 }
 
 #[zq_class(name = "BrowserProcess", payload = BrowserProcessPayload, payload_no_gc)]
@@ -522,6 +556,7 @@ impl JSBrowserProcess {
             .ok_or_else(|| cx.throw_type("not a BrowserProcess instance"))?;
         let child = payload.child.clone();
         let user_data_dir = payload.user_data_dir.clone();
+        let killed = payload.killed.clone();
         cx.promise_fut_result(
             async move {
                 let mut guard = child.lock().await;
@@ -533,6 +568,8 @@ impl JSBrowserProcess {
                         None => chrome::kill_and_reap(&mut child, CLOSE_TIMEOUT).await,
                     }
                 }
+                drop(guard);
+                killed.store(true, Ordering::SeqCst);
                 Ok(())
             },
             |_cx, ()| Ok(ZqValue::undefined()),
@@ -557,15 +594,10 @@ impl JSBrowserProcess {
     fn pid<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let p = JSBrowserProcess::payload(cx, cc.this())
             .ok_or_else(|| cx.throw_type("not a BrowserProcess instance"))?;
-        let pid = p
-            .child
-            .try_lock()
-            .ok()
-            .and_then(|g| g.as_ref().and_then(|c| c.id()));
-        match pid {
-            Some(pid) => Ok(ZqValue::int32(pid as i32)),
-            None => Ok(ZqValue::null()),
+        if p.killed.load(Ordering::SeqCst) {
+            return Ok(ZqValue::null());
         }
+        Ok(ZqValue::int32(p.pid as i32))
     }
 }
 

@@ -1,4 +1,6 @@
-AIKE := ../aike/target/debug/aike
+# The aike host that runs tests/*.mjs. Override on the command line:
+#   make test AIKE=/path/to/aike
+AIKE ?= ../llm-work/aike/target/debug/aike
 
 # Rust names the cdylib differently per platform.
 ifeq ($(OS),Windows_NT)
@@ -13,7 +15,11 @@ build:
 	mbx build
 	cp $(LIB) tests/browser.aike
 
-test: build
+# types/browser.d.ts vs the #[zq_method] registration table.
+check-types:
+	$(AIKE) -m tests/check_dts.mjs
+
+test: build check-types
 	$(AIKE) -m tests/import_zapi.mjs
 	$(AIKE) -m tests/regression_launch_race.mjs
 	$(AIKE) -m tests/regression_launch_failure_cleanup.mjs
@@ -29,4 +35,4 @@ clean:
 	mbx clean
 	rm -f tests/browser.aike
 
-.PHONY: build test clean
+.PHONY: build check-types test clean

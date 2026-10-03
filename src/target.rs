@@ -8,6 +8,10 @@ use zuqe_zapi::*;
 use crate::class_browser::get_browser_payload;
 
 /// `browser.getTargets()`
+///
+/// `Target.getTargets` answers `{ targetInfos: [...] }`; that wrapper is passed
+/// through as-is, so the declaration says `Promise<{ targetInfos: TargetInfo[] }>`
+/// rather than an array.
 pub(crate) fn js_browser_get_targets<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,

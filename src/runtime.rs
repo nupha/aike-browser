@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
 use crate::{
+    Listener,
     class_page::{get_page_client, get_page_session},
     helpers::{self, format_exception},
     require_callback, with_state,
@@ -196,10 +197,11 @@ pub(crate) fn js_page_on_console<'a>(
 
     let client_ev = client.clone();
     let session_ev = session_id.clone();
-    helpers::spawn(async move {
+    let task = helpers::spawn(async move {
         let mut event_rx = client_ev.subscribe_events();
         loop {
             match event_rx.recv().await {
+                Ok(evt) if evt.shutdown => break,
                 Ok(evt)
                     if evt.method == "Runtime.consoleAPICalled"
                         && evt.session_id.as_deref() == Some(&session_ev) =>
@@ -221,6 +223,12 @@ pub(crate) fn js_page_on_console<'a>(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+    });
+
+    // Registering twice replaces the forwarding task instead of stacking a
+    // second one, which delivered every console message to both callbacks.
+    with_state(cx, |st| {
+        st.set_listener_task(Listener::Console, &session_id, task)
     });
 
     Ok(ZqValue::undefined())

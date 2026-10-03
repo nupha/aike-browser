@@ -1,32 +1,92 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
-//! Page class — the main browser tab/page abstraction.
+//! Page class 鈥?the main browser tab/page abstraction.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tokio::sync::broadcast;
 use zuqe_zapi::*;
 use zuqe_zapi_macros::{zq_class, zq_class_impl, zq_method};
 
-use crate::{cdp, helpers, input, network};
+use crate::{cdp, helpers, input, log::LogBuffer, network};
 
 // ---------------------------------------------------------------------------
 // Network capture state
 // ---------------------------------------------------------------------------
 
+/// Retained capture entries. `Network.dataReceived` / `dataReceived`-class
+/// events fire thousands of times for a single page load, so an unbounded
+/// vector turned "capture a page" into an allocation that never stops growing.
+pub(crate) const CAPTURE_CAP: usize = 5000;
+
+/// Network capture state for one page.
+///
+/// A plain `Mutex`, not `tokio::sync::Mutex`: every critical section here is a
+/// few instructions with no `await` inside, and `try_lock` (which
+/// `stopNetworkCapture` used) silently skipped the very stop it was asked for.
 #[derive(Clone)]
 pub(crate) struct PageNetworkState {
-    pub(crate) capture_handle: Arc<AsyncMutex<Option<tokio::task::JoinHandle<()>>>>,
-    pub(crate) captured_requests: Arc<AsyncMutex<Vec<serde_json::Value>>>,
+    /// The event-forwarding task. Each `startNetworkCapture` replaces (and
+    /// aborts) it, `stopNetworkCapture` takes it.
+    capture_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    captured_requests: Arc<Mutex<VecDeque<serde_json::Value>>>,
 }
 
 impl PageNetworkState {
     pub(crate) fn new() -> Self {
         Self {
-            capture_handle: Arc::new(AsyncMutex::new(None)),
-            captured_requests: Arc::new(AsyncMutex::new(Vec::new())),
+            capture_handle: Arc::new(Mutex::new(None)),
+            captured_requests: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    /// Install a capture task, aborting the one it replaces 鈥?a second
+    /// `startNetworkCapture` used to drop the first handle on the floor and
+    /// leave its task running forever.
+    pub(crate) fn start_capture(&self, task: tokio::task::JoinHandle<()>) {
+        let replaced = self
+            .capture_handle
+            .lock()
+            .map(|mut slot| slot.replace(task))
+            .unwrap_or(None);
+        if let Some(old) = replaced {
+            old.abort();
+        }
+    }
+
+    pub(crate) fn stop_capture(&self) {
+        let stopped = self
+            .capture_handle
+            .lock()
+            .map(|mut slot| slot.take())
+            .unwrap_or(None);
+        if let Some(task) = stopped {
+            task.abort();
+        }
+    }
+
+    pub(crate) fn record(&self, entry: serde_json::Value) {
+        if let Ok(mut buf) = self.captured_requests.lock() {
+            buf.push_back(entry);
+            while buf.len() > CAPTURE_CAP {
+                buf.pop_front();
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<serde_json::Value> {
+        self.captured_requests
+            .lock()
+            .map(|buf| buf.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn clear(&self) {
+        if let Ok(mut buf) = self.captured_requests.lock() {
+            buf.clear();
         }
     }
 }
@@ -40,6 +100,23 @@ pub(crate) struct PagePayload {
     pub(crate) session_id: String,
     pub(crate) target_id: String,
     pub(crate) network: PageNetworkState,
+    /// Console/log ring, owned here so `page.close()` frees it (see B-050).
+    pub(crate) log_buffer: LogBuffer,
+}
+
+/// A fresh `PagePayload` for `session_id`, with empty capture and log state.
+pub(crate) fn new_page_payload(
+    client: cdp::CdpClient,
+    session_id: String,
+    target_id: String,
+) -> PagePayload {
+    PagePayload {
+        client,
+        session_id,
+        target_id,
+        network: PageNetworkState::new(),
+        log_buffer: Arc::new(Mutex::new(VecDeque::new())),
+    }
 }
 
 // The payload holds no GC-managed JS values (only the `targetId` JS property,
@@ -54,17 +131,41 @@ impl JSPage {
         Err(cx.throw_type("Page cannot be constructed directly; use browser.newPage()"))
     }
 
-    // ── Page domain ──
+    // 鈹€鈹€ Page domain 鈹€鈹€
 
-    /// `page.navigate(url)`
+    /// `page.navigate(url)` 鈥?rejects when the navigation itself failed.
     #[zq_method]
     fn navigate<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let url = cc.arg(0).coerce_string(cx).unwrap_or_default();
-        send_page_void_cmd(
-            cx,
-            &cc,
-            "Page.navigate",
-            Some(serde_json::json!({ "url": url })),
+        let payload = get_page_payload(cx, cc.this())?;
+        let client = payload.client.clone();
+        let session_id = payload.session_id.clone();
+        cx.promise_fut_result(
+            async move {
+                let resp = client
+                    .send(
+                        "Page.navigate",
+                        Some(serde_json::json!({ "url": url })),
+                        Some(&session_id),
+                    )
+                    .await?;
+                // `Page.navigate` answers with success even when the browser
+                // could not load the URL 鈥?the failure is in `errorText`
+                // (measured: a refused port yields `net::ERR_UNSAFE_PORT`).
+                // Discarding the result made a dead navigation resolve.
+                if let Some(err) = resp
+                    .get("errorText")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Err(format!("navigate failed: {err}"));
+                }
+                if resp.get("isDownload").and_then(|v| v.as_bool()) == Some(true) {
+                    return Err("navigate resulted in a download, not a page".to_string());
+                }
+                Ok(())
+            },
+            |_cx, ()| Ok(ZqValue::undefined()),
         )
     }
 
@@ -72,17 +173,42 @@ impl JSPage {
     #[zq_method(name = "waitForSelector")]
     fn wait_for_selector<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
-        let timeout_ms: i64 = if cc.len() > 1 {
-            cc.arg_f64(cx, 1).map(|n| n as i64).unwrap_or(30000)
-        } else {
-            30000
-        };
+        let timeout_ms = timeout_ms_or_default(cx, &cc, 1, 30_000);
 
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
-        let selector_js = selector.replace('\'', "\\'");
+        // A JS string literal, JSON-encoded: splicing the selector into `'...'`
+        // broke on a quote in it and turned a syntax error into a full-timeout
+        // wait.
+        let selector_lit = serde_json::to_string(&selector)
+            .map_err(|e| cx.throw_type(&format!("selector is not representable: {e}")))?;
 
         cx.promise_fut_result(async move {
+                // `document.body` is null until the parser reaches <body>, so
+                // the watcher polls until there is something to observe.
+                // Without that guard `mo.observe(null)` threw a TypeError on
+                // every document that had not finished parsing yet.
+                let js_code = |attempt_ms: i64| {
+                    format!(
+                        "new Promise((resolve, reject) => {{\
+                         const SEL = {selector_lit};\
+                         let mo = null;\
+                         const done = () => {{ if (mo) mo.disconnect(); resolve(true); }};\
+                         const watch = () => {{\
+                         if (document.querySelector(SEL)) {{ done(); return; }}\
+                         if (document.body) {{\
+                         mo = new MutationObserver(() => {{\
+                         if (document.querySelector(SEL)) done();\
+                         }});\
+                         mo.observe(document.body, {{ childList: true, subtree: true }});\
+                         }} else {{ setTimeout(watch, 50); }}\
+                         }};\
+                         watch();\
+                         setTimeout(() => {{ if (mo) mo.disconnect(); reject(new Error('timeout')); }}, {attempt_ms});\
+                         }})"
+                    )
+                };
+
                 // Retry with a short per-attempt timeout so that, if `navigate`
                 // returns before the new document is ready, a stale-context
                 // evaluate is retried once the navigation commits.
@@ -94,38 +220,28 @@ impl JSPage {
                         return Err("selector not found or timed out".to_string());
                     }
                     let attempt_ms = remaining.as_millis().min(1000) as i64;
-                    let js_code = format!(
-                        "new Promise((resolve, reject) => {{\
-                         let el = document.querySelector('{selector_js}');\
-                         if (el) {{ resolve(true); return; }}\
-                         let mo = new MutationObserver(() => {{\
-                         if (document.querySelector('{selector_js}')) {{\
-                         mo.disconnect(); resolve(true);\
-                         }}\
-                         }});\
-                         mo.observe(document.body, {{ childList: true, subtree: true }});\
-                         setTimeout(() => {{ mo.disconnect(); reject(new Error('timeout')); }}, {attempt_ms});\
-                         }})"
-                    );
-                    let val = match client
+                    let val = client
                         .send(
                             "Runtime.evaluate",
                             Some(serde_json::json!({
-                                "expression": js_code,
+                                "expression": js_code(attempt_ms),
                                 "awaitPromise": true,
                             })),
                             Some(&session_id),
                         )
-                        .await
-                    {
-                        Ok(val) => val,
-                        Err(e) => return Err(e),
+                        .await?;
+                    let Some(details) = val.get("exceptionDetails") else {
+                        return Ok(());
                     };
-                    if val.get("exceptionDetails").is_some() {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        continue;
+                    // Only a selector that no amount of waiting can satisfy is
+                    // reported early; everything else (a lost execution context,
+                    // a document still parsing) is retried until the caller's
+                    // own deadline.
+                    let msg = helpers::format_exception(details);
+                    if is_bad_selector(&msg) {
+                        return Err(format!("waitForSelector: {msg}"));
                     }
-                    return Ok(());
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             },
             |_cx, ()| Ok(ZqValue::undefined()),
@@ -136,11 +252,7 @@ impl JSPage {
     #[zq_method(name = "waitForFunction")]
     fn wait_for_function<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let expr = cc.arg(0).coerce_string(cx).unwrap_or_default();
-        let timeout_ms: i64 = if cc.len() > 1 {
-            cc.arg_f64(cx, 1).map(|n| n as i64).unwrap_or(30000)
-        } else {
-            30000
-        };
+        let timeout_ms = timeout_ms_or_default(cx, &cc, 1, 30_000);
 
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
@@ -354,24 +466,24 @@ impl JSPage {
     }
 
     /// `page.waitForNavigation(timeoutMs?)`
+    ///
+    /// Waits for a cross-document load *or* a same-document (SPA) navigation:
+    /// listening only for `Page.loadEventFired` meant `history.pushState`,
+    /// a hash change or a link click could never satisfy it.
     #[zq_method(name = "waitForNavigation")]
     fn wait_for_navigation<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
-        let timeout_ms: u64 = if cc.len() > 0 {
-            cc.arg_f64(cx, 0)
-                .map(|n| n as i64)
-                .unwrap_or(30000)
-                .max(1000) as u64
-        } else {
-            30000
-        };
+        let timeout_ms = timeout_ms_or_default(cx, &cc, 0, 30_000).max(0) as u64;
 
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
         cx.promise_fut_result(
             async move {
-                let _ = client.send("Page.enable", None, Some(&session_id)).await;
+                // Subscribe first: `Page.enable` and the navigation it is waiting
+                // for can both complete before a subscriber created afterwards
+                // looks at the stream, and the event is gone for good.
                 let mut event_rx = client.subscribe_events();
+                client.send("Page.enable", None, Some(&session_id)).await?;
                 let timeout = tokio::time::sleep(Duration::from_millis(timeout_ms));
                 tokio::pin!(timeout);
                 loop {
@@ -379,13 +491,19 @@ impl JSPage {
                         event = event_rx.recv() => {
                             match event {
                                 Ok(evt) => {
-                                    if evt.method == "Page.loadEventFired"
-                                        && evt.session_id.as_deref() == Some(&session_id)
+                                    if evt.session_id.as_deref() == Some(&session_id)
+                                        && matches!(
+                                            evt.method.as_str(),
+                                            "Page.loadEventFired" | "Page.navigatedWithinDocument"
+                                        )
                                     {
                                         return Ok(());
                                     }
                                 }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    log::warn!("waitForNavigation lagged by {n} events");
+                                    continue;
+                                }
                                 Err(broadcast::error::RecvError::Closed) => {
                                     return Err("CDP connection closed".to_string());
                                 }
@@ -611,7 +729,7 @@ impl JSPage {
         )
     }
 
-    // ── Page domain — extended ──
+    // 鈹€鈹€ Page domain 鈥?extended 鈹€鈹€
 
     /// `page.setContent(html)`
     #[zq_method(name = "setContent")]
@@ -744,7 +862,7 @@ impl JSPage {
         )
     }
 
-    // ── Input domain ──
+    // 鈹€鈹€ Input domain 鈹€鈹€
 
     #[zq_method(name = "mouseClick")]
     fn mouse_click<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -781,7 +899,7 @@ impl JSPage {
         input::js_page_insert_text(cx, cc)
     }
 
-    // ── DOM domain ──
+    // 鈹€鈹€ DOM domain 鈹€鈹€
 
     #[zq_method(name = "querySelector")]
     fn query_selector<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -843,7 +961,7 @@ impl JSPage {
         crate::dom::js_page_type_backend_node(cx, cc)
     }
 
-    // ── Emulation domain ──
+    // 鈹€鈹€ Emulation domain 鈹€鈹€
 
     #[zq_method(name = "setGeolocation")]
     fn set_geolocation<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -875,7 +993,7 @@ impl JSPage {
         crate::emulation::js_page_set_cpu_throttling(cx, cc)
     }
 
-    // ── Fetch domain ──
+    // 鈹€鈹€ Fetch domain 鈹€鈹€
 
     #[zq_method(name = "setRequestInterception")]
     fn set_request_interception<'a>(
@@ -905,7 +1023,7 @@ impl JSPage {
         crate::fetch::js_page_on_request_paused(cx, cc)
     }
 
-    // ── Network domain ──
+    // 鈹€鈹€ Network domain 鈹€鈹€
 
     #[zq_method(name = "getCookies")]
     fn get_cookies<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -1000,7 +1118,7 @@ impl JSPage {
         network::js_page_clear_browser_cookies(cx, cc)
     }
 
-    // ── Log domain ──
+    // 鈹€鈹€ Log domain 鈹€鈹€
 
     #[zq_method(name = "onLog")]
     fn on_log<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -1012,7 +1130,7 @@ impl JSPage {
         crate::log::js_page_get_console_messages(cx, cc)
     }
 
-    // ── Storage domain ──
+    // 鈹€鈹€ Storage domain 鈹€鈹€
 
     #[zq_method(name = "clearData")]
     fn clear_data<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -1027,7 +1145,7 @@ impl JSPage {
         crate::storage::js_page_get_storage_key_for_frame(cx, cc)
     }
 
-    // ── Overlay domain ──
+    // 鈹€鈹€ Overlay domain 鈹€鈹€
 
     #[zq_method]
     fn highlight<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -1039,7 +1157,7 @@ impl JSPage {
         crate::overlay::js_page_hide_highlight(cx, cc)
     }
 
-    // ── CSS domain ──
+    // 鈹€鈹€ CSS domain 鈹€鈹€
 
     #[zq_method(name = "getComputedStyle")]
     fn get_computed_style<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -1051,14 +1169,14 @@ impl JSPage {
         crate::css::js_page_get_matched_styles(cx, cc)
     }
 
-    // ── IO domain ──
+    // 鈹€鈹€ IO domain 鈹€鈹€
 
     #[zq_method(name = "readStream")]
     fn read_stream<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         crate::io::js_page_read_stream(cx, cc)
     }
 
-    // ── Tracing domain ──
+    // 鈹€鈹€ Tracing domain 鈹€鈹€
 
     #[zq_method(name = "startTracing")]
     fn start_tracing<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
@@ -1164,6 +1282,32 @@ pub(crate) fn get_enum_prop(
     allowed: &[&str],
 ) -> Result<Option<String>, ZqError> {
     obj.get_enum(cx, key, allowed)
+}
+
+/// True for the one `waitForSelector` failure that waiting cannot fix: the
+/// selector itself does not parse. Chrome words it as a `SyntaxError` from
+/// `querySelector`; everything else it can throw (lost execution context, a
+/// document still parsing) is worth another round.
+///
+/// Message sniffing rather than a strict classification because the wording is
+/// V8's, not the protocol's, and the caller's timeout remains the backstop.
+fn is_bad_selector(message: &str) -> bool {
+    message.contains("SyntaxError") && message.contains("selector")
+}
+
+/// Resolve an optional `timeoutMs` argument.
+///
+/// A missing argument, an explicit `undefined`, and anything `ToNumber` cannot
+/// produce a finite number from all mean "use the default". Reading them through
+/// `as i64` instead turned both `undefined` (NaN) and a typo into `0`, i.e. an
+/// immediate timeout 鈥?and `waitForNavigation(undefined)` landed on `0.max(1000)`
+/// rather than the documented 30000.
+fn timeout_ms_or_default(cx: ZqCtx, cc: &ZqCallInfo, nth: usize, default: i64) -> i64 {
+    cc.arg_f64(cx, nth)
+        .ok()
+        .filter(|n| n.is_finite())
+        .map(|n| n as i64)
+        .unwrap_or(default)
 }
 
 /// Shared helper for `back()` / `forward()`: step `delta` entries through the

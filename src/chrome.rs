@@ -24,23 +24,37 @@ static SPAWNED_BROWSERS: OnceLock<Mutex<Vec<Arc<tokio::sync::Mutex<Option<Child>
 
 /// Kill every registered `Browser.spawn()` child. Called from the engine's
 /// atexit / signal-handler cleanup alongside `spawn::kill_all_children`.
+///
+/// The registry is drained rather than walked: leaving entries behind would pin
+/// their slots (and their `Child`) for the rest of the process lifetime, so a
+/// spawn/kill loop grew it without bound.
 pub(crate) fn kill_all_spawned_browsers() {
-    if let Some(reg) = SPAWNED_BROWSERS.get()
-        && let Ok(guard) = reg.lock()
-    {
-        for arc in guard.iter() {
-            if let Ok(mut slot) = arc.try_lock()
-                && let Some(child) = slot.as_mut()
-            {
-                let _ = child.start_kill();
-            }
+    let Some(reg) = SPAWNED_BROWSERS.get() else {
+        return;
+    };
+    let Ok(mut guard) = reg.lock() else {
+        return;
+    };
+
+    for arc in guard.drain(..) {
+        // Taking the child hands it to tokio's orphan queue, so it is reaped
+        // instead of lingering un-waited until the runtime itself exits.
+        if let Ok(mut slot) = arc.try_lock()
+            && let Some(mut child) = slot.take()
+        {
+            let _ = child.start_kill();
         }
     }
 }
 
 pub(crate) fn register_spawned_child(handle: &Arc<tokio::sync::Mutex<Option<Child>>>) {
     let reg = SPAWNED_BROWSERS.get_or_init(|| Mutex::new(Vec::new()));
-    reg.lock().unwrap().push(handle.clone());
+    let mut guard = reg.lock().unwrap();
+    // The registry tracks *live* processes: entries whose child is already gone
+    // are dropped, so it cannot grow with every spawn/kill cycle. A contended
+    // slot is kept — "cannot tell" must not mean "no such process".
+    guard.retain(|slot| !matches!(slot.try_lock(), Ok(locked) if locked.is_none()));
+    guard.push(handle.clone());
 }
 
 /// Terminate a spawned browser child and **reap** it: `start_kill()` only
@@ -136,7 +150,7 @@ pub(crate) async fn spawn(
     proxy_url: Option<&str>,
     kill_on_drop: bool,
 ) -> Result<SpawnedBrowser, String> {
-    let user_data_dir = auto_data_dir(port);
+    let user_data_dir = auto_data_dir();
     // Only auto mode (no explicit `args`) creates this dir; a custom command
     // line owns wherever it points, so it must never be deleted by us.
     let owns_data_dir = args.is_none();
@@ -225,20 +239,31 @@ pub(crate) async fn shutdown_and_cleanup(
     remove_profile_dir(user_data_dir).await;
 }
 
-/// Unique per-launch user-data-dir (pid + seq); explicit-port launches keep
-/// the historical `aike-chrome-<port>` name.
-fn auto_data_dir(port: u16) -> std::path::PathBuf {
-    let dir_name = if port == 0 {
-        format!(
-            "aike-chrome-{}-{}",
-            std::process::id(),
-            LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed)
-        )
-    } else {
-        format!("aike-chrome-{}", port)
-    };
+/// Unique per-launch user-data-dir (pid + seq).
+///
+/// Every launch gets its own name, including explicit-port ones: keying by port
+/// made two launches on the same port share `<tempdir>/aike-chrome-<port>`, and
+/// whichever closed first recursively deleted the directory the other was still
+/// using.
+fn auto_data_dir() -> std::path::PathBuf {
+    let dir_name = format!(
+        "aike-chrome-{}-{}",
+        std::process::id(),
+        LAUNCH_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     std::env::temp_dir().join(dir_name)
 }
+
+/// Features switched off in auto mode, all in the one `--disable-features`
+/// value Chrome keeps.
+const DISABLED_FEATURES: &[&str] = &[
+    "ChromeWhatsNewUI",
+    "InterestFeedLoading",
+    "MediaRouter",
+    "NavigationThreading",
+    "OptimizationHints",
+    "SafeBrowsingEnhancedProtection",
+];
 
 /// Assemble the standard Chrome command line (incl. anti-detection flags).
 fn chrome_args(
@@ -258,7 +283,6 @@ fn chrome_args(
         // Without this, modern Chrome on macOS may silently skip the debug.
         // Set window-size so the actual Chrome frame is large enough.
         format!("--user-data-dir={}", user_data_dir.display()),
-
         // === Anti-detection parameters (Phase 1) ===
         // Hide navigator.webdriver attribute (most important one)
         "--disable-blink-features=AutomationControlled".to_string(),
@@ -273,12 +297,18 @@ fn chrome_args(
         "--disable-domain-reliability".to_string(),
         "--disable-background-timer-throttling".to_string(),
         "--disable-backgrounding-occluded-windows".to_string(),
-        "--disable-features=ChromeWhatsNewUI,InterestFeedLoading,MediaRouter,NavigationThreading,OptimizationHints".to_string(),
-        "--disable-features=SafeBrowsingEnhancedProtection".to_string(),
         "--disable-webrtc".to_string(),
         "--lang=en-US".to_string(),
         "--disable-dev-shm-usage".to_string(),
     ];
+
+    // One switch, one value: `--disable-features` is a single-valued option, so
+    // passing it twice kept only the last list and silently dropped the first
+    // five features.
+    args.push(format!(
+        "--disable-features={}",
+        DISABLED_FEATURES.join(",")
+    ));
 
     if headless {
         args.push("--headless=new".to_string());

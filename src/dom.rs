@@ -14,10 +14,13 @@ pub(crate) async fn resolve_selector(
     selector: &str,
 ) -> Result<i64, String> {
     let _ = client.send("DOM.enable", None, Some(session_id)).await;
+    // `depth: 0`: only the root's `nodeId` is used, and `DOM.querySelector`
+    // resolves against the live tree. `depth: -1` made Chrome serialize the
+    // entire subtree into JSON on every selector call, all of it discarded.
     let doc = client
         .send(
             "DOM.getDocument",
-            Some(serde_json::json!({ "depth": -1 })),
+            Some(serde_json::json!({ "depth": 0 })),
             Some(session_id),
         )
         .await?
@@ -34,6 +37,7 @@ pub(crate) async fn resolve_selector(
         .await?
         .get("nodeId")
         .and_then(|v| v.as_i64())
+        .filter(|id| *id != 0)
         .ok_or_else(|| format!("selector not found: {selector}"))
 }
 
@@ -66,10 +70,11 @@ pub(crate) fn js_page_query_selector_all<'a>(
     cx.promise_fut_result(
         async move {
             let _ = client.send("DOM.enable", None, Some(&session_id)).await;
+            // `depth: 0` — see `resolve_selector`.
             let root = client
                 .send(
                     "DOM.getDocument",
-                    Some(serde_json::json!({ "depth": -1 })),
+                    Some(serde_json::json!({ "depth": 0 })),
                     Some(&session_id),
                 )
                 .await?
@@ -277,19 +282,31 @@ pub(crate) fn js_page_type<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqVa
 }
 
 /// Build the aria-node JSON string from a raw `Accessibility.getFullAXTree` result.
+///
+/// Nodes marked `ignored` are dropped: an ignored node is not exposed to
+/// assistive technology, and its whole subtree comes along with it, so leaving
+/// them in produced a tree with links to nodes no accessibility client can
+/// reach. `parentIndex` is resolved against the *kept* nodes only.
 fn build_aria_nodes(val: &serde_json::Value) -> String {
     let Some(ax_nodes) = val.get("nodes").and_then(|n| n.as_array()) else {
         return "[]".to_string();
     };
-    let mut out: Vec<serde_json::Value> = Vec::new();
-    let mut idx_of: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut kept: Vec<&serde_json::Value> = Vec::new();
+    for n in ax_nodes {
+        if !n.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false) {
+            kept.push(n);
+        }
+    }
+
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(kept.len());
+    // Positions are into `ax_nodes`, which is what `parentId` refers to.
+    let mut kept_pos: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for (i, n) in ax_nodes.iter().enumerate() {
-        let node_id = n
-            .get("nodeId")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        idx_of.insert(node_id, i);
+        if !n.get("ignored").and_then(|v| v.as_bool()).unwrap_or(false) {
+            kept_pos.insert(i, kept_pos.len());
+        }
+    }
+    for n in kept.iter() {
         let role = n
             .get("role")
             .and_then(|v| v.get("value"))
@@ -311,7 +328,7 @@ fn build_aria_nodes(val: &serde_json::Value) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         out.push(serde_json::json!({
-            "nodeId": node_id,
+            "nodeId": ax_node_id(n),
             "backendNodeId": n.get("backendDOMNodeId").and_then(|v| v.as_u64()).unwrap_or(0),
             "parentIndex": -1,
             "contentType": "element",
@@ -319,17 +336,52 @@ fn build_aria_nodes(val: &serde_json::Value) -> String {
             "attributes": { "role": role, "name": name, "description": desc },
         }));
     }
+    // A kept node's parent is often itself ignored — the `role: none` wrappers an
+    // accessibility tree uses to hide a subtree (measured on the page_aria.mjs
+    // fixture: 2 of 14 nodes, and they were the parent of every interactive
+    // element) — so walk up until a kept ancestor appears instead of leaving the
+    // node detached at -1.
+    let pos_of_id: std::collections::HashMap<i64, usize> = ax_nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| ax_node_id(n).map(|id| (id, i)))
+        .collect();
     for (i, n) in ax_nodes.iter().enumerate() {
-        let parent_idx = n
-            .get("parentId")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<u64>().ok())
-            .and_then(|p| idx_of.get(&p).copied())
-            .map(|x| x as i64)
-            .unwrap_or(-1i64);
-        out[i]["parentIndex"] = serde_json::json!(parent_idx);
+        let Some(&slot) = kept_pos.get(&i) else {
+            continue;
+        };
+        let mut parent_idx = -1i64;
+        let mut cursor = n.get("parentId").and_then(ax_node_id);
+        let mut guard = 0;
+        while let Some(id) = cursor {
+            // Bounded so a malformed `parentId` cycle cannot spin here.
+            guard += 1;
+            if guard > ax_nodes.len() {
+                break;
+            }
+            let Some(&pos) = pos_of_id.get(&id) else {
+                break;
+            };
+            if let Some(&kept_slot) = kept_pos.get(&pos) {
+                parent_idx = kept_slot as i64;
+                break;
+            }
+            cursor = ax_nodes[pos].get("parentId").and_then(ax_node_id);
+        }
+        out[slot]["parentIndex"] = serde_json::json!(parent_idx);
     }
     serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// `Accessibility.AXNodeId`: a decimal string, and **signed** — Chrome numbers
+/// its inline-text pseudo nodes negatively (`-1000000002` and friends). Parsing
+/// as `u64` failed on every one of them, and the old code then reported `0`,
+/// which aliased the root and broke the parent links into them.
+fn ax_node_id(v: &serde_json::Value) -> Option<i64> {
+    v.get("nodeId")
+        .and_then(|v| v.as_str())?
+        .parse::<i64>()
+        .ok()
 }
 
 /// `page.ariaSnapshot()`
@@ -342,10 +394,15 @@ pub(crate) fn js_page_aria_snapshot<'a>(
         let _ = client
             .send("Accessibility.enable", None, Some(&session_id))
             .await;
-        let val = client
+        let tree = client
             .send("Accessibility.getFullAXTree", None, Some(&session_id))
-            .await?;
-        Ok(build_aria_nodes(&val))
+            .await;
+        // `Accessibility.enable` keeps the whole a11y tree live, which the
+        // protocol warns measurably slows the page down until it is disabled.
+        let _ = client
+            .send("Accessibility.disable", None, Some(&session_id))
+            .await;
+        tree.map(|val| build_aria_nodes(&val))
     })
 }
 

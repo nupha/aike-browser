@@ -29,9 +29,10 @@ mod tracing;
 
 pub use {class_browser::JSBrowser, class_page::JSPage};
 
-use chrome::kill_all_spawned_browsers;
-
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use zuqe_zapi::{
     ZqCtx, ZqError, ZqGcTrace, ZqGcTraceCtx, ZqRawValue, ZqRuntime, ZqRuntimeState, ZqValue,
@@ -39,15 +40,55 @@ use zuqe_zapi::{
 use zuqe_zapi_macros::zq_module;
 
 use cdp::CdpClient;
+use chrome::kill_all_spawned_browsers;
+
+/// Which CDP event stream a listener belongs to.
+///
+/// Every listener owns one forwarding task and one event job, so a second
+/// registration for the same scope has to *replace* them rather than stack a
+/// second pair (which would deliver each event twice).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Listener {
+    /// `page.onLog` (scoped by session id).
+    Log,
+    /// `page.onConsole` (scoped by session id).
+    Console,
+    /// `page.setRequestInterception` / `onRequestPaused` (scoped by session id).
+    Fetch,
+    /// `browser.handleCertificateError` (scoped by its `accept` magic).
+    Cert,
+}
+
+/// One registered `handleCertificateError` listener.
+///
+/// `accept` is a native function and cannot capture anything, so the connection
+/// it acts on travels in the trampoline's `magic` value — which is why this is
+/// a struct rather than a bare callback.
+pub(crate) struct CertListener {
+    /// The JS callback.
+    pub(crate) callback: ZqRawValue,
+    /// The CDP connection `accept()` drives.
+    pub(crate) client: CdpClient,
+}
+
+/// Next `accept` trampoline magic. Dense, so it always fits the `i32` the
+/// `#[zq_function]` body reads back through `cc.magic()`.
+static CERT_MAGIC: AtomicU32 = AtomicU32::new(1);
+
+pub(crate) fn next_cert_magic() -> i32 {
+    CERT_MAGIC.fetch_add(1, Ordering::Relaxed) as i32
+}
 
 /// Per-runtime browser-side state (the JS callbacks this module holds outside
 /// the GC heap).
 #[derive(Default)]
 pub(crate) struct BrowserState {
-    /// `handleCertificateError` callback (last wins).
-    cert_callback: Option<ZqRawValue>,
-    /// CDP client backing the generated `accept` closure.
-    cert_client: Option<CdpClient>,
+    /// `handleCertificateError` listeners, keyed by their `accept` magic.
+    ///
+    /// One slot per runtime let two browsers deliver each other's certificate
+    /// errors, and re-registering left the first forwarding task running so
+    /// both callbacks fired for every event.
+    cert_listeners: HashMap<i32, CertListener>,
     /// session id -> `onRequestPaused` callback (last wins).
     fetch_callbacks: HashMap<String, ZqRawValue>,
     /// `(session, requestId)` pairs the JS side already continued / aborted /
@@ -57,6 +98,13 @@ pub(crate) struct BrowserState {
     log_console_callbacks: HashMap<String, ZqRawValue>,
     /// session id -> `page.onConsole` callback.
     runtime_console_callbacks: HashMap<String, ZqRawValue>,
+    /// The tokio task forwarding CDP events into each listener's event job.
+    ///
+    /// Held so that re-registering a listener stops its predecessor and
+    /// switching it off stops it entirely; without this, `onLog(cb)` twice
+    /// delivers every message to both callbacks, and every
+    /// `setRequestInterception` toggle leaks a task.
+    listener_tasks: HashMap<(Listener, String), tokio::task::JoinHandle<()>>,
 }
 
 impl BrowserState {
@@ -74,6 +122,49 @@ impl BrowserState {
             .fetch_handled
             .remove(&(session_id.to_string(), request_id.to_string()))
     }
+
+    /// Register (or replace) this browser's certificate-error listener.
+    pub(crate) fn set_cert_listener(
+        &mut self,
+        magic: i32,
+        callback: ZqRawValue,
+        client: CdpClient,
+    ) {
+        self.cert_listeners
+            .insert(magic, CertListener { callback, client });
+    }
+
+    /// The connection an `accept` call belongs to.
+    pub(crate) fn cert_client(&self, magic: i32) -> Option<CdpClient> {
+        self.cert_listeners.get(&magic).map(|l| l.client.clone())
+    }
+
+    /// Install a listener's forwarding task, aborting whatever it replaces.
+    ///
+    /// `scope` is the session id for page-level listeners and the magic rendered
+    /// as a string for the browser-level certificate listener. The superseded
+    /// `ZqWakeSender` is dropped with the old task, which disconnects the old
+    /// event job.
+    pub(crate) fn set_listener_task(
+        &mut self,
+        listener: Listener,
+        scope: &str,
+        task: tokio::task::JoinHandle<()>,
+    ) {
+        if let Some(old) = self
+            .listener_tasks
+            .insert((listener, scope.to_string()), task)
+        {
+            old.abort();
+        }
+    }
+
+    /// Stop a listener's forwarding task: `setRequestInterception(false)`.
+    pub(crate) fn clear_listener_task(&mut self, listener: Listener, scope: &str) {
+        if let Some(task) = self.listener_tasks.remove(&(listener, scope.to_string())) {
+            task.abort();
+        }
+    }
 }
 
 impl ZqGcTrace for BrowserState {
@@ -89,8 +180,8 @@ impl ZqGcTrace for BrowserState {
                 let _ = gcx.mark(*cb);
             }
         }
-        if let Some(cb) = self.cert_callback {
-            let _ = gcx.mark(cb);
+        for cb in self.cert_listeners.values() {
+            let _ = gcx.mark(cb.callback);
         }
     }
 }

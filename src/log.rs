@@ -3,27 +3,103 @@
 
 //! Page class — Log domain methods (flat on `Page`).
 
-use std::sync::{LazyLock, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
-use crate::{
-    class_page::{get_page_client, get_page_session, send_page_void_cmd},
-    helpers, require_callback, with_state,
-};
+use crate::{Listener, class_page::send_page_void_cmd, helpers, require_callback, with_state};
 
-/// Per-session ring buffer of console/log entries.
-static LOG_BUFFER: LazyLock<Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+/// Buffered console/log entries of one page.
+///
+/// Owned by the page payload, so it dies with the page (a process-global map
+/// keyed by session id outlived `page.close()` and grew without bound).
+pub(crate) type LogBuffer = Arc<Mutex<VecDeque<serde_json::Value>>>;
+
+/// Entries kept per page. A long-lived capture of `console.log` in a loop must
+/// not turn into an unbounded allocation; the oldest entries are dropped.
+pub(crate) const LOG_BUFFER_CAP: usize = 1000;
+
+/// Append an entry, dropping the oldest once [`LOG_BUFFER_CAP`] is reached.
+pub(crate) fn push_log(buffer: &LogBuffer, entry: serde_json::Value) {
+    if let Ok(mut buf) = buffer.lock() {
+        buf.push_back(entry);
+        while buf.len() > LOG_BUFFER_CAP {
+            buf.pop_front();
+        }
+    }
+}
+
+/// Render a `Log.entryAdded` / `Runtime.consoleAPICalled` payload as one
+/// `ConsoleMessage`.
+///
+/// The two events have unrelated shapes (`{entry:{text,level,source}}` versus
+/// `{type,args:[{value}]}`), so passing either through raw meant a caller
+/// reading `msg.text` saw it for one and not the other.
+fn to_console_message(params: &serde_json::Value) -> serde_json::Value {
+    let text = params
+        .get("entry")
+        .and_then(|e| e.get("text"))
+        .or_else(|| params.get("text"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            // `Runtime.consoleAPICalled` carries the message as pre-rendered
+            // `RemoteObject`s; `description` is what a browser devtools shows.
+            params
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|args| args.iter().map(arg_text).collect::<Vec<_>>().join(" "))
+                .unwrap_or_default()
+        });
+    serde_json::json!({
+        "source": params
+            .get("entry")
+            .and_then(|e| e.get("source"))
+            .and_then(|v| v.as_str())
+            .or_else(|| params.get("type").and_then(|v| v.as_str()))
+            .unwrap_or(""),
+        "level": params
+            .get("entry")
+            .and_then(|e| e.get("level"))
+            .and_then(|v| v.as_str())
+            .or_else(|| params.get("type").and_then(|v| v.as_str()))
+            .unwrap_or("log"),
+        "text": text,
+        "params": params,
+    })
+}
+
+fn json_to_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// One `Runtime.consoleAPICalled` argument rendered as text. `description` is
+/// what devtools shows (`"a"` with quotes, `"3"` for a number); `value` is the
+/// fallback for arguments that have neither.
+fn arg_text(a: &serde_json::Value) -> String {
+    a.get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| a.get("value").map(json_to_text))
+        .unwrap_or_default()
+}
 
 /// `page.onLog(callback)`
 pub(crate) fn js_page_on_log<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let client = get_page_client(cx, cc.this())?;
-    let session_id = get_page_session(cx, cc.this())?;
+    let payload = crate::class_page::get_page_payload(cx, cc.this())?;
+    let client = payload.client.clone();
+    let session_id = payload.session_id.clone();
+    let buffer = payload.log_buffer.clone();
 
     // Store the callback keyed by session in the runtime's traced state so the
     // GC keeps the JS function alive while it lives in this native-side map.
@@ -33,7 +109,11 @@ pub(crate) fn js_page_on_log<'a>(
             .insert(session_id.clone(), callback);
     });
 
+    // Both domains feed this listener, and `Runtime` has to be on for
+    // `console.log` to show up at all — enabling only `Log` silently delivered
+    // network and JavaScript errors only.
     let _ = send_page_void_cmd(cx, &cc, "Log.enable", None);
+    let _ = send_page_void_cmd(cx, &cc, "Runtime.enable", None);
 
     let tx = cx.spawn_event_job("log", move |cx, msg: serde_json::Value| {
         let sess = msg
@@ -56,21 +136,17 @@ pub(crate) fn js_page_on_log<'a>(
 
     let client_ev = client.clone();
     let session_ev = session_id.clone();
-    helpers::spawn(async move {
+    let task = helpers::spawn(async move {
         let mut event_rx = client_ev.subscribe_events();
         loop {
             match event_rx.recv().await {
+                Ok(evt) if evt.shutdown => break,
                 Ok(evt)
                     if (evt.method == "Log.entryAdded"
                         || evt.method == "Runtime.consoleAPICalled")
                         && evt.session_id.as_deref() == Some(&session_ev) =>
                 {
-                    if let Ok(mut guard) = LOG_BUFFER.lock() {
-                        guard
-                            .entry(session_ev.clone())
-                            .or_default()
-                            .push(evt.params.clone());
-                    }
+                    push_log(&buffer, to_console_message(&evt.params));
                     let msg = serde_json::json!({
                         "sessionId": evt.session_id,
                         "params": evt.params,
@@ -89,28 +165,34 @@ pub(crate) fn js_page_on_log<'a>(
             }
         }
     });
+    // Registering twice replaces the forwarding task instead of stacking a
+    // second one, which would deliver every message to both callbacks.
+    with_state(cx, |st| {
+        st.set_listener_task(Listener::Log, &session_id, task)
+    });
 
     Ok(ZqValue::undefined())
 }
 
-/// `page.getConsoleMessages(clear?)`
+/// `page.getConsoleMessages(clear?)` — synchronous (the buffer is a plain
+/// in-process ring; there is nothing to await).
 pub(crate) fn js_page_get_console_messages<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
     let clear = cc.len() > 0 && cc.arg_bool(cx, 0).unwrap_or(false);
-    let session_id = get_page_session(cx, cc.this())?;
+    let buffer = crate::class_page::get_page_payload(cx, cc.this())?
+        .log_buffer
+        .clone();
 
-    let mut messages: Vec<serde_json::Value> = Vec::new();
-    if let Ok(mut guard) = LOG_BUFFER.lock()
-        && let Some(buf) = guard.get_mut(&session_id)
-    {
-        messages = std::mem::take(buf);
-    }
-
-    if !clear && let Ok(mut guard) = LOG_BUFFER.lock() {
-        guard.insert(session_id, messages.clone());
-    }
+    // One lock, no gap: taking the buffer and putting it back left a window in
+    // which a freshly arriving entry was appended to the emptied buffer and
+    // then overwritten by the re-insertion.
+    let messages: Vec<serde_json::Value> = match buffer.lock() {
+        Ok(mut guard) if clear => guard.drain(..).collect(),
+        Ok(guard) => guard.iter().cloned().collect(),
+        Err(_) => Vec::new(),
+    };
 
     ZqValue::from_json(cx, &serde_json::Value::Array(messages))
 }

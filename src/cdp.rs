@@ -32,8 +32,10 @@ type WsWriter = futures_util::stream::SplitSink<WsStream, Message>;
 type WsReader = futures_util::stream::SplitStream<WsStream>;
 
 /// In-flight commands awaiting a response, keyed by command id. Shared with
-/// [`CdpClient`] so a timeout can drop its own entry.
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
+/// [`CdpClient`] so a timeout can drop its own entry. The method name rides
+/// along so a failure can name the command that produced it.
+type Pending =
+    Arc<Mutex<HashMap<u64, (String, oneshot::Sender<Result<serde_json::Value, String>>)>>>;
 
 /// How long a command may stay unanswered before the caller's promise rejects.
 /// Chrome sometimes stops replying (renderer gone, a request held by Fetch
@@ -46,11 +48,16 @@ pub(crate) struct CdpEvent {
     pub(crate) method: String,
     pub(crate) params: serde_json::Value,
     pub(crate) session_id: Option<String>,
+    /// Only set on the synthetic event [`CdpClient::disconnect`] publishes, so
+    /// subscribers stop even though the broadcast channel itself stays open
+    /// (every `CdpClient` clone holds a sender).
+    pub(crate) shutdown: bool,
 }
 
 /// A command submitted to the background WebSocket task.
 struct CdpCommand {
     msg: String,
+    method: String,
     resp_tx: oneshot::Sender<Result<serde_json::Value, String>>,
 }
 
@@ -61,6 +68,8 @@ pub(crate) struct CdpClient {
     next_id: Arc<AtomicU64>,
     event_tx: broadcast::Sender<CdpEvent>,
     pending: Pending,
+    /// Flipped by [`Self::disconnect`] to tear the background loop down.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 /// How long [`CdpClient::connect`] keeps retrying a *refused* WebSocket before
@@ -120,12 +129,21 @@ impl CdpClient {
         let next_id = Arc::new(AtomicU64::new(1));
         let (event_tx, _) = broadcast::channel::<CdpEvent>(256);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let bg_writer = writer.clone();
         let bg_event_tx = event_tx.clone();
         let bg_pending = pending.clone();
         let handle = tokio::spawn(async move {
-            Self::run_background(bg_writer, reader, cmd_rx, bg_event_tx, bg_pending).await;
+            Self::run_background(
+                bg_writer,
+                reader,
+                cmd_rx,
+                bg_event_tx,
+                bg_pending,
+                shutdown_rx,
+            )
+            .await;
         });
 
         Ok((
@@ -134,6 +152,7 @@ impl CdpClient {
                 next_id,
                 event_tx,
                 pending,
+                shutdown: shutdown_tx,
             },
             handle,
         ))
@@ -174,57 +193,93 @@ impl CdpClient {
     }
 
     /// Background loop: forward commands to WS and dispatch responses / events.
+    ///
+    /// Exits on whichever comes first: the command channel closing, the reader
+    /// stopping, or [`CdpClient::disconnect`]. Every exit path rejects the
+    /// in-flight commands and publishes a shutdown event, so neither a caller
+    /// nor a listener can be left waiting on a socket nobody reads.
     async fn run_background(
         writer: Arc<tokio::sync::Mutex<WsWriter>>,
         mut reader: WsReader,
         mut cmd_rx: mpsc::UnboundedReceiver<CdpCommand>,
         event_tx: broadcast::Sender<CdpEvent>,
         pending: Pending,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         let pending_r = pending.clone();
         let event_tx_r = event_tx.clone();
         // The reader is the only source of responses: once it stops, every
-        // in-flight command must fail rather than wait on a dead peer.
-        let (reader_done_tx, mut reader_done_rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            while let Some(msg) = reader.next().await {
-                match msg {
-                    Ok(Message::Text(text)) => {
+        // in-flight command must fail rather than wait on a dead peer. It also
+        // reports *why* it stopped, so a clean Close frame is not reported as a
+        // dropped channel.
+        let (reader_done_tx, mut reader_done_rx) = oneshot::channel::<String>();
+        let reader_task = tokio::spawn(async move {
+            let reason = loop {
+                match reader.next().await {
+                    Some(Ok(Message::Text(text))) => {
                         if !Self::try_dispatch_response(&pending_r, &text) {
                             Self::dispatch_event(&event_tx_r, &text);
                         }
                     }
-                    Ok(Message::Close(_)) => break,
-                    Err(e) => {
-                        log::warn!("CDP WS read error: {e}");
-                        break;
+                    // A Close frame is the peer saying goodbye, not a fault.
+                    Some(Ok(Message::Close(frame))) => {
+                        break match frame {
+                            Some(f) => format!(
+                                "CDP connection closed by the browser (code {}, {})",
+                                u16::from(f.code),
+                                f.reason
+                            ),
+                            None => "CDP connection closed by the browser".to_string(),
+                        };
                     }
-                    _ => {}
+                    Some(Err(e)) => {
+                        log::warn!("CDP WS read error: {e}");
+                        break format!("CDP WebSocket read failed: {e}");
+                    }
+                    Some(_) => {}
+                    None => break "CDP WebSocket stream ended".to_string(),
                 }
-            }
-            let _ = reader_done_tx.send(());
+            };
+            let _ = reader_done_tx.send(reason);
         });
 
-        loop {
+        let reason = loop {
             let cmd = tokio::select! {
-                cmd = cmd_rx.recv() => cmd,
-                _ = &mut reader_done_rx => {
-                    log::warn!("CDP reader task finished, shutting down");
-                    break;
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(cmd) => cmd,
+                    None => break "CDP command channel closed".to_string(),
+                },
+                done = &mut reader_done_rx => {
+                    break done.unwrap_or_else(|_| "CDP reader task vanished".to_string());
+                }
+                // `Err` here means the sender is gone, which also means "gone".
+                _ = shutdown_rx.changed() => {
+                    break "CDP connection closed by the client".to_string();
                 }
             };
-            let Some(cmd) = cmd else {
-                log::debug!("CDP command channel closed, shutting down");
-                break;
-            };
             if Self::send_cmd(&writer, cmd, &pending).await.is_err() {
-                break;
+                break "CDP WebSocket write failed".to_string();
             }
-        }
+        };
+        log::debug!("CDP background loop shutting down: {reason}");
+
+        // The reader task owns the read half, so aborting it and dropping the
+        // writer is what actually closes the connection.
+        reader_task.abort();
+        drop(writer);
+
+        // Wake every listener: the broadcast channel stays open because the
+        // `CdpClient` clones each hold a sender, so `Closed` never arrives.
+        let _ = event_tx.send(CdpEvent {
+            method: String::new(),
+            params: serde_json::Value::Null,
+            session_id: None,
+            shutdown: true,
+        });
 
         // Nothing will answer the survivors now.
-        for (_, tx) in pending.lock().unwrap().drain() {
-            let _ = tx.send(Err("CDP connection closed".to_string()));
+        for (_, (method, tx)) in pending.lock().unwrap().drain() {
+            let _ = tx.send(Err(format!("CDP `{method}`: {reason}")));
         }
     }
 
@@ -244,7 +299,10 @@ impl CdpClient {
             .unwrap_or(0);
 
         // Claim the id before writing so a response can never arrive unclaimed.
-        pending.lock().unwrap().insert(id, cmd.resp_tx);
+        pending
+            .lock()
+            .unwrap()
+            .insert(id, (cmd.method, cmd.resp_tx));
 
         if let Err(e) = writer
             .lock()
@@ -271,22 +329,36 @@ impl CdpClient {
         };
 
         let tx = pending.lock().unwrap().remove(&id);
-        if let Some(tx) = tx {
-            let result = if let Some(error) = val.get("error") {
-                Err(error
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("CDP error")
-                    .to_string())
-            } else {
-                Ok(val
+        if let Some((method, tx)) = tx {
+            let result = match val.get("error") {
+                Some(error) => Err(Self::format_error(&method, error)),
+                None => Ok(val
                     .get("result")
                     .cloned()
-                    .unwrap_or(serde_json::Value::Null))
+                    .unwrap_or(serde_json::Value::Null)),
             };
             let _ = tx.send(result);
         }
         true
+    }
+
+    /// Render a CDP `error` object. Chrome puts a human sentence in `message`,
+    /// but the numeric `code` and the domain-specific `data` are what make a
+    /// failure actionable (which parameter was missing, which node was stale),
+    /// so keep them instead of passing on `message` alone.
+    fn format_error(method: &str, error: &serde_json::Value) -> String {
+        let message = error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("CDP error");
+        let mut out = format!("CDP `{method}` failed: {message}");
+        if let Some(code) = error.get("code").and_then(|v| v.as_i64()) {
+            out.push_str(&format!(" (code {code})"));
+        }
+        if let Some(data) = error.get("data").filter(|d| !d.is_null()) {
+            out.push_str(&format!(" [data: {data}]"));
+        }
+        out
     }
 
     /// Forward a CDP event (message without "id") to the broadcast channel.
@@ -310,6 +382,7 @@ impl CdpClient {
             method,
             params,
             session_id,
+            shutdown: false,
         });
     }
 
@@ -336,18 +409,32 @@ impl CdpClient {
     /// Send a CDP command and await its response.
     ///
     /// Rejects instead of hanging when the peer dies, when the command loop is
-    /// gone, or when the command goes unanswered for [`CMD_TIMEOUT`].
+    /// gone, when the connection was already [`Self::disconnect`]ed, or when the
+    /// command goes unanswered for [`CMD_TIMEOUT`].
     pub(crate) async fn send(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
         session_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
+        // Nothing reads the command channel after a disconnect, so a command
+        // issued then would sit until the timeout instead of failing at once.
+        if self.is_closed() {
+            return Err(format!("CDP `{method}`: connection already closed"));
+        }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let msg = Self::build_msg(method, params, session_id, id);
         let (tx, mut rx) = oneshot::channel();
 
-        if self.cmd_tx.send(CdpCommand { msg, resp_tx: tx }).is_err() {
+        if self
+            .cmd_tx
+            .send(CdpCommand {
+                msg,
+                method: method.to_string(),
+                resp_tx: tx,
+            })
+            .is_err()
+        {
             return Err("CDP command channel closed".to_string());
         }
 
@@ -387,18 +474,46 @@ impl CdpClient {
 
     /// Subscribe to CDP events (messages without "id").
     /// Returns a receiver that gets all CDP events from all sessions.
+    ///
+    /// The receiver also yields one synthetic event with `shutdown: true` when
+    /// the connection goes away — including on [`Self::disconnect`], which the
+    /// broadcast channel alone cannot report (its senders outlive it).
     pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<CdpEvent> {
         self.event_tx.subscribe()
     }
 
+    /// Close the connection. Idempotent.
+    ///
+    /// Used by `browser.close()` in attach mode: without it the WebSocket and
+    /// its reader task outlive the `Browser` object, because every `Page` holds
+    /// a client clone and the command channel is never closed.
+    pub(crate) fn disconnect(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    /// True once [`Self::disconnect`] has been called or the loop has exited.
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
     /// Close a target (tab).
     pub(crate) async fn close_target(&self, target_id: &str) -> Result<(), String> {
-        self.send(
-            "Target.closeTarget",
-            Some(serde_json::json!({ "targetId": target_id })),
-            None,
-        )
-        .await?;
+        let resp = self
+            .send(
+                "Target.closeTarget",
+                Some(serde_json::json!({ "targetId": target_id })),
+                None,
+            )
+            .await?;
+        // The command can succeed at the protocol level while the target
+        // survives; `success: false` with an `errorText` is a real failure.
+        if resp.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            let why = resp
+                .get("errorText")
+                .and_then(|v| v.as_str())
+                .unwrap_or("target was not closed");
+            return Err(format!("Target.closeTarget: {why}"));
+        }
         Ok(())
     }
 }

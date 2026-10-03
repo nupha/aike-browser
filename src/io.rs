@@ -9,6 +9,9 @@ use zuqe_zapi::*;
 use crate::{cdp::CdpClient, class_page::get_page_payload};
 
 /// Read a CDP IO stream (`handle`) to completion and return its UTF-8 text.
+///
+/// Always closes the handle, including on the error paths: an `IO.read` handle
+/// that is never closed stays pinned in the browser for the life of the page.
 pub(crate) async fn read_io_stream(
     client: &CdpClient,
     session_id: &str,
@@ -18,13 +21,18 @@ pub(crate) async fn read_io_stream(
     let chunk: u64 = 1 << 16; // 64 KiB per read
     let mut buf: Vec<u8> = Vec::new();
 
-    loop {
-        let rx = client.send(
-            "IO.read",
-            Some(serde_json::json!({ "handle": handle, "offset": offset, "size": chunk })),
-            Some(session_id),
-        );
-        let resp = rx.await?;
+    let result = loop {
+        let resp = match client
+            .send(
+                "IO.read",
+                Some(serde_json::json!({ "handle": handle, "offset": offset, "size": chunk })),
+                Some(session_id),
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => break Err(e),
+        };
 
         let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
         let base64 = resp
@@ -32,25 +40,46 @@ pub(crate) async fn read_io_stream(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let written = if base64 {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .unwrap_or_default();
-            buf.extend_from_slice(&bytes);
-            bytes.len()
+            // A decode failure used to yield zero bytes, so `offset` never
+            // advanced and the loop re-read the same offset forever — a request
+            // storm against the browser.
+            match base64::engine::general_purpose::STANDARD.decode(data) {
+                Ok(bytes) => {
+                    buf.extend_from_slice(&bytes);
+                    bytes.len()
+                }
+                Err(e) => break Err(format!("IO.read: bad base64 chunk: {e}")),
+            }
         } else {
             let bytes = data.as_bytes();
             buf.extend_from_slice(bytes);
             bytes.len()
         };
 
-        let eof = resp.get("eof").and_then(|v| v.as_bool()).unwrap_or(false);
-        if eof {
-            break;
+        if resp.get("eof").and_then(|v| v.as_bool()).unwrap_or(false) {
+            break Ok(());
+        }
+        if written == 0 {
+            // No progress and no eof: the stream cannot advance any further.
+            break Err("IO.read: stream produced no data and signalled no eof".to_string());
         }
         offset += written as u64;
-    }
+    };
 
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    close(client, session_id, handle).await;
+    result.map(|()| String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Release a CDP IO stream handle, ignoring the outcome (the read already
+/// succeeded or already failed).
+async fn close(client: &CdpClient, session_id: &str, handle: &str) {
+    let _ = client
+        .send(
+            "IO.close",
+            Some(serde_json::json!({ "handle": handle })),
+            Some(session_id),
+        )
+        .await;
 }
 
 /// `page.readStream(handle)`

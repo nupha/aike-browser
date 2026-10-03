@@ -46,8 +46,14 @@ async function bodyText(page) {
 }
 
 // Navigate (interception catches it) and poll the resulting document body.
+// The navigation is allowed to fail: these cases point at `http://localhost:1`,
+// which Chrome refuses outright (`net::ERR_UNSAFE_PORT`), and `navigate` reports
+// that. What each test is about is what interception did to the request, not
+// whether the network was reachable.
 async function navigateBody(page, url) {
-  await page.navigate(url);
+  try {
+    await page.navigate(url);
+  } catch (e) {}
   return await poll(
     async () => {
       const v = await bodyText(page);

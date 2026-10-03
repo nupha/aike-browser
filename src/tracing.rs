@@ -13,12 +13,15 @@ use crate::{
     io::read_io_stream,
 };
 
+/// How long `stopTracing` waits for Chrome to finish writing the stream.
+const TRACE_DRAIN: Duration = Duration::from_secs(5);
+
 /// `page.startTracing(categories?)`
 pub(crate) fn js_page_start_tracing<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let categories = if cc.len() > 0 {
+    let categories = if !cc.is_empty() {
         cc.arg(0).coerce_string(cx).unwrap_or_default()
     } else {
         String::new()
@@ -26,11 +29,13 @@ pub(crate) fn js_page_start_tracing<'a>(
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
     cx.promise_fut_void(async move {
+        // No `options`: it is a free-form trace-config string and the value
+        // that used to be sent ("simplifyNames") is not one Chrome recognises,
+        // so it only looked like a setting.
         let mut params = serde_json::json!({
             "bufferUsageReportingInterval": 0,
             "transferMode": "ReturnAsStream",
             "streamCompression": "none",
-            "options": "simplifyNames",
         });
         if !categories.is_empty() {
             params["categories"] = serde_json::Value::String(categories);
@@ -50,30 +55,46 @@ pub(crate) fn js_page_stop_tracing<'a>(
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
     cx.promise_fut_string(async move {
-        let _ = client.send("Tracing.end", None, Some(&session_id)).await;
-
+        // Subscribe *before* ending the trace: `Tracing.tracingComplete` can
+        // arrive immediately, and a subscriber created afterwards waited out
+        // the full timeout and then returned an empty string.
         let mut event_rx = client.subscribe_events();
-        let session_clone = session_id.clone();
+        let session_cap = session_id.clone();
+        client.send("Tracing.end", None, Some(&session_id)).await?;
+
         let mut stream_handle: Option<String> = None;
-        let wait = tokio::time::sleep(Duration::from_secs(5));
+        let mut data_loss = false;
+        let wait = tokio::time::sleep(TRACE_DRAIN);
         tokio::pin!(wait);
         loop {
             tokio::select! {
                 event = event_rx.recv() => {
                     match event {
+                        Ok(evt) if evt.shutdown => {
+                            return Err("CDP connection closed while waiting for the trace".to_string());
+                        }
                         Ok(evt)
                             if evt.method == "Tracing.tracingComplete"
-                                && evt.session_id.as_deref() == Some(&session_clone) =>
+                                && evt.session_id.as_deref() == Some(&session_cap) =>
                         {
                             stream_handle = evt
                                 .params
                                 .get("stream")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
+                            // A dropped trace is not a silent empty result.
+                            data_loss = evt
+                                .params
+                                .get("dataLossOccurred")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
                             break;
                         }
                         Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("CDP tracing listener lagged by {n} events");
+                            continue;
+                        }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -81,11 +102,14 @@ pub(crate) fn js_page_stop_tracing<'a>(
             }
         }
 
-        Ok(match stream_handle {
-            Some(h) => read_io_stream(&client, &session_id, &h)
-                .await
-                .unwrap_or_default(),
-            None => String::new(),
-        })
+        let Some(handle) = stream_handle else {
+            return Err(
+                "Tracing.end produced no trace: Chrome sent no tracingComplete event".to_string(),
+            );
+        };
+        if data_loss {
+            log::warn!("stopTracing: Chrome reported dataLossOccurred; the trace is incomplete");
+        }
+        read_io_stream(&client, &session_id, &handle).await
     })
 }

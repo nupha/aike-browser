@@ -3,11 +3,7 @@
 
 //! Page class — Network domain methods (cookies, capture, response body).
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-
+use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
 use crate::{
@@ -22,7 +18,36 @@ use crate::{
 /// `Network.CookieSameSite` values.
 const COOKIE_SAME_SITE: &[&str] = &["Strict", "Lax", "None"];
 
-/// Convert a CDP cookie JSON value to a JS object.
+/// Copy the cookie fields `Network.setCookie` accepts from `cookie` into
+/// `params`, so `getCookies()` → `setCookies()` round-trips without silently
+/// dropping attributes.
+fn cookie_fields_to_params(
+    cx: ZqCtx,
+    cookie: &ZqValue,
+    params: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ZqError> {
+    for key in ["name", "value", "domain", "path"] {
+        if let Some(v) = get_str_prop(cx, cookie, key) {
+            params.insert(key.into(), serde_json::Value::String(v));
+        }
+    }
+    for key in ["httpOnly", "secure"] {
+        if let Some(v) = get_bool_prop(cx, cookie, key) {
+            params.insert(key.into(), serde_json::Value::Bool(v));
+        }
+    }
+    if let Some(same_site) = get_enum_prop(cx, cookie, "sameSite", COOKIE_SAME_SITE)? {
+        params.insert("sameSite".into(), serde_json::Value::String(same_site));
+    }
+    if let Some(expires) = get_number_prop(cx, cookie, "expires") {
+        params.insert("expires".into(), serde_json::json!(expires));
+    }
+    Ok(())
+}
+
+/// Convert a CDP cookie JSON value to a JS object, carrying every field
+/// `setCookie` can store back — `expires` / `sameSite` / `priority` used to be
+/// dropped here, so a round-trip quietly rewrote the cookie.
 fn cookie_to_js<'a>(cx: ZqCtx<'a>, c: &serde_json::Value) -> Result<ZqValue<'a>, ZqError> {
     let obj = ZqValue::new_object(cx)?;
     for key in ["name", "value", "domain", "path"] {
@@ -30,11 +55,23 @@ fn cookie_to_js<'a>(cx: ZqCtx<'a>, c: &serde_json::Value) -> Result<ZqValue<'a>,
             obj.set_str(cx, key, ZqValue::new_string(cx, s)?)?;
         }
     }
-    if let Some(b) = c.get("httpOnly").and_then(|v| v.as_bool()) {
-        obj.set_str(cx, "httpOnly", ZqValue::bool(b))?;
+    for key in ["httpOnly", "secure", "session"] {
+        if let Some(b) = c.get(key).and_then(|v| v.as_bool()) {
+            obj.set_str(cx, key, ZqValue::bool(b))?;
+        }
     }
-    if let Some(b) = c.get("secure").and_then(|v| v.as_bool()) {
-        obj.set_str(cx, "secure", ZqValue::bool(b))?;
+    if let Some(s) = c.get("sameSite").and_then(|v| v.as_str()) {
+        obj.set_str(cx, "sameSite", ZqValue::new_string(cx, s)?)?;
+    }
+    for key in ["expires", "priority", "size", "sourcePort", "sourceScheme"] {
+        // `Network.Cookie.expires` is `-1` for a session cookie; surfacing that
+        // would make an omitted expiry look like 1970.
+        if key == "expires" && c.get(key).and_then(|v| v.as_f64()).is_some_and(|e| e < 0.0) {
+            continue;
+        }
+        if let Some(n) = c.get(key).and_then(|v| v.as_f64()) {
+            obj.set_str(cx, key, ZqValue::from_json(cx, &serde_json::json!(n))?)?;
+        }
     }
     Ok(obj)
 }
@@ -82,25 +119,10 @@ pub(crate) fn js_page_set_cookie<'a>(
         .as_object()
         .ok_or_else(|| cx.throw_type("setCookie requires an object argument"))?;
 
-    let mut params = serde_json::Map::new();
-    for key in ["name", "value", "domain", "path"] {
-        if let Some(v) = get_str_prop(cx, &cookie, key) {
-            params.insert(key.into(), serde_json::Value::String(v));
-        }
-    }
     // The flag/attribute fields `Network.setCookie` accepts but a name/value
     // pair does not carry: dropping them silently stored a different cookie.
-    for key in ["httpOnly", "secure"] {
-        if let Some(v) = get_bool_prop(cx, &cookie, key) {
-            params.insert(key.into(), serde_json::Value::Bool(v));
-        }
-    }
-    if let Some(same_site) = get_enum_prop(cx, &cookie, "sameSite", COOKIE_SAME_SITE)? {
-        params.insert("sameSite".into(), serde_json::Value::String(same_site));
-    }
-    if let Some(expires) = get_number_prop(cx, &cookie, "expires") {
-        params.insert("expires".into(), serde_json::json!(expires));
-    }
+    let mut params = serde_json::Map::new();
+    cookie_fields_to_params(cx, &cookie, &mut params)?;
 
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
@@ -197,7 +219,7 @@ pub(crate) fn js_page_set_cookies<'a>(
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
     let mut cookies = Vec::new();
-    if cc.len() > 0
+    if !cc.is_empty()
         && let Some(arr) = cc.arg(0).as_array(cx)?
         && let Ok(len) = arr.length(cx)
     {
@@ -206,18 +228,10 @@ pub(crate) fn js_page_set_cookies<'a>(
                 continue;
             };
             if let Some(obj) = item.as_object() {
+                // Same field set as `setCookie`, so a batch read back from
+                // `getCookies()` keeps `sameSite` / `expires` / `httpOnly`.
                 let mut c = serde_json::Map::new();
-                for key in ["name", "value", "domain", "path"] {
-                    if let Some(v) = get_str_prop(cx, &obj, key) {
-                        c.insert(key.into(), serde_json::Value::String(v));
-                    }
-                }
-                if let Some(b) = get_bool_prop(cx, &obj, "secure") {
-                    c.insert("secure".into(), serde_json::Value::Bool(b));
-                }
-                if let Some(b) = get_bool_prop(cx, &obj, "httpOnly") {
-                    c.insert("httpOnly".into(), serde_json::Value::Bool(b));
-                }
+                cookie_fields_to_params(cx, &obj, &mut c)?;
                 cookies.push(serde_json::Value::Object(c));
             }
         }
@@ -285,80 +299,68 @@ pub(crate) fn js_page_start_network_capture<'a>(
         async move {
             cdp_network::enable_network(&client, &session_id).await?;
 
-            let running = Arc::new(AtomicBool::new(true));
-            let captured = network.captured_requests.clone();
             let mut event_rx = client.subscribe_events();
-            let session_id_cap = session_id.clone();
-            let running_clone = running.clone();
-
+            let session_cap = session_id.clone();
+            let recorder = network.clone();
+            // No poll interval and no stop flag: the loop is woken by the event
+            // stream itself, and it ends when the stream does. The old shape
+            // woke every 200ms for the whole capture, and after `Closed` it
+            // spun that timer at full speed until someone called
+            // `stopNetworkCapture`.
             let handle = helpers::spawn(async move {
-                while running_clone.load(Ordering::SeqCst) {
-                    tokio::select! {
-                        event = event_rx.recv() => {
-                            if let Ok(evt) = event
-                                && evt.session_id.as_deref() == Some(&session_id_cap)
-                                && evt.method.starts_with("Network.")
-                                && let Ok(mut guard) = captured.try_lock()
-                            {
-                                guard.push(serde_json::json!({
-                                    "method": evt.method,
-                                    "params": evt.params,
-                                }));
-                            }
+                loop {
+                    match event_rx.recv().await {
+                        Ok(evt) if evt.shutdown => break,
+                        Ok(evt)
+                            if evt.session_id.as_deref() == Some(&session_cap)
+                                && evt.method.starts_with("Network.") =>
+                        {
+                            recorder.record(serde_json::json!({
+                                "method": evt.method,
+                                "params": evt.params,
+                            }));
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("CDP network-capture listener lagged by {n} events");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             });
 
-            if let Ok(mut guard) = network.capture_handle.try_lock() {
-                *guard = Some(handle);
-            }
+            // Aborts the task a previous `startNetworkCapture` left running.
+            network.start_capture(handle);
             Ok(())
         },
         |_cx, ()| Ok(ZqValue::undefined()),
     )
 }
 
-/// `page.stopNetworkCapture()`
+/// `page.stopNetworkCapture()` — synchronous.
 pub(crate) fn js_page_stop_network_capture<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let payload = get_page_payload(cx, cc.this())?;
-    let network = payload.network.clone();
-    if let Ok(mut guard) = network.capture_handle.try_lock()
-        && let Some(handle) = guard.take()
-    {
-        handle.abort();
-    }
+    get_page_payload(cx, cc.this())?.network.stop_capture();
     Ok(ZqValue::undefined())
 }
 
-/// `page.getCapturedRequests()`
+/// `page.getCapturedRequests()` — synchronous.
 pub(crate) fn js_page_get_captured_requests<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let payload = get_page_payload(cx, cc.this())?;
-    let requests: Vec<serde_json::Value> =
-        if let Ok(guard) = payload.network.captured_requests.try_lock() {
-            guard.clone()
-        } else {
-            Vec::new()
-        };
+    let requests = get_page_payload(cx, cc.this())?.network.snapshot();
     ZqValue::from_json(cx, &serde_json::Value::Array(requests))
 }
 
-/// `page.clearCapturedRequests()`
+/// `page.clearCapturedRequests()` — synchronous.
 pub(crate) fn js_page_clear_captured_requests<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
-    let payload = get_page_payload(cx, cc.this())?;
-    if let Ok(mut guard) = payload.network.captured_requests.try_lock() {
-        guard.clear();
-    }
+    get_page_payload(cx, cc.this())?.network.clear();
     Ok(ZqValue::undefined())
 }
 

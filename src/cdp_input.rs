@@ -96,6 +96,7 @@ pub(crate) async fn mouse_click(
         y,
         button,
         click_count,
+        None,
     )
     .await?;
     dispatch_mouse(
@@ -106,6 +107,7 @@ pub(crate) async fn mouse_click(
         y,
         button,
         click_count,
+        None,
     )
     .await
 }
@@ -117,7 +119,61 @@ pub(crate) async fn mouse_move(
     x: f64,
     y: f64,
 ) -> Result<(), String> {
-    dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0).await
+    dispatch_mouse(client, session_id, "mouseMoved", x, y, "none", 0, None).await
+}
+
+/// Move the mouse while a drag button is held.
+///
+/// `buttons` is the pressed-button mask (`Input.dispatchMouseEvent.buttons`:
+/// Left=1, Right=2, Middle=4). Omitting it — as a plain [`mouse_move`] does —
+/// tells the renderer no button is down, which cancels the in-flight drag: the
+/// page then sees no `drag*` event at all.
+pub(crate) async fn mouse_move_dragging(
+    client: &CdpClient,
+    session_id: &str,
+    x: f64,
+    y: f64,
+    buttons: i32,
+) -> Result<(), String> {
+    dispatch_mouse(
+        client,
+        session_id,
+        "mouseMoved",
+        x,
+        y,
+        "left",
+        0,
+        Some(buttons),
+    )
+    .await
+}
+
+/// Dispatch an `Input.dispatchDragEvent` of `event_type` at (x,y).
+///
+/// `type` is one of `dragEnter` / `dragOver` / `drop` / `dragCancel`; this
+/// Chrome has no `dragLeave`.
+pub(crate) async fn drag_event(
+    client: &CdpClient,
+    session_id: &str,
+    event_type: &str,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    client
+        .send(
+            "Input.dispatchDragEvent",
+            Some(serde_json::json!({
+                "type": event_type,
+                "x": x,
+                "y": y,
+                // No `items`: the extension moves an element, it does not carry a
+                // payload. `dragOperationsMask` 1 = copy.
+                "data": { "items": [], "dragOperationsMask": 1 },
+            })),
+            Some(session_id),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Dispatch `mousePressed` at (x,y) without releasing ?pairs with `mouse_up`
@@ -138,6 +194,7 @@ pub(crate) async fn mouse_down(
         y,
         button,
         click_count,
+        None,
     )
     .await
 }
@@ -159,10 +216,12 @@ pub(crate) async fn mouse_up(
         y,
         button,
         click_count,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_mouse(
     client: &CdpClient,
     session_id: &str,
@@ -171,14 +230,18 @@ async fn dispatch_mouse(
     y: f64,
     button: &str,
     click_count: i32,
+    buttons: Option<i32>,
 ) -> Result<(), String> {
-    let params = serde_json::json!({
+    let mut params = serde_json::json!({
         "type": event_type,
         "x": x,
         "y": y,
         "button": button,
         "clickCount": click_count,
     });
+    if let Some(b) = buttons {
+        params["buttons"] = serde_json::json!(b);
+    }
     client
         .send("Input.dispatchMouseEvent", Some(params), Some(session_id))
         .await?;
