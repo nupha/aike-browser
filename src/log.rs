@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — Log domain methods (flat on `Page`).
 
 use std::sync::{LazyLock, Mutex};
 
+use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
 use crate::{
     class_page::{get_page_client, get_page_session, send_page_void_cmd},
-    helpers,
-    with_state,
+    helpers, require_callback, with_state,
 };
 
 /// Per-session ring buffer of console/log entries.
@@ -27,14 +27,15 @@ pub(crate) fn js_page_on_log<'a>(
 
     // Store the callback keyed by session in the runtime's traced state so the
     // GC keeps the JS function alive while it lives in this native-side map.
-    let callback = cc.arg(0).raw();
+    let callback = require_callback(cx, cc.arg(0))?;
     with_state(cx, |st| {
-        st.log_console_callbacks.insert(session_id.clone(), callback);
+        st.log_console_callbacks
+            .insert(session_id.clone(), callback);
     });
 
     let _ = send_page_void_cmd(cx, &cc, "Log.enable", None);
 
-    let tx = cx.spawn_channel_job("log", move |cx, msg: serde_json::Value| {
+    let tx = cx.spawn_event_job("log", move |cx, msg: serde_json::Value| {
         let sess = msg
             .get("sessionId")
             .and_then(|v| v.as_str())
@@ -48,13 +49,9 @@ pub(crate) fn js_page_on_log<'a>(
             .and_then(|s| with_state(cx, |st| st.log_console_callbacks.get(s).copied()));
         if let (Some(cb), Some(_sess)) = (cb, sess)
             && let Ok(obj) = ZqValue::from_json(cx, &params)
-            && ZqValue::from(cb).call(cx, ZqValue::undefined(), &[obj]).is_err()
         {
-            let exc = cx.take_exception();
-            #[cfg(debug_assertions)]
-            helpers::print_exc(cx, exc);
+            cx.call_event_handler(cb, ZqValue::undefined(), &[obj], "log");
         }
-        ZqChannelPoll::Continue
     });
 
     let client_ev = client.clone();
@@ -69,7 +66,10 @@ pub(crate) fn js_page_on_log<'a>(
                         && evt.session_id.as_deref() == Some(&session_ev) =>
                 {
                     if let Ok(mut guard) = LOG_BUFFER.lock() {
-                        guard.entry(session_ev.clone()).or_default().push(evt.params.clone());
+                        guard
+                            .entry(session_ev.clone())
+                            .or_default()
+                            .push(evt.params.clone());
                     }
                     let msg = serde_json::json!({
                         "sessionId": evt.session_id,
@@ -80,7 +80,12 @@ pub(crate) fn js_page_on_log<'a>(
                     }
                 }
                 Ok(_) => {}
-                Err(_) => break,
+                // Lagging only means this listener missed events, not that the
+                // stream is dead: dropping the receiver would silently kill it.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("CDP log listener lagged by {n} events");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });

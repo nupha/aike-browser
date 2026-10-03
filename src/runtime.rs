@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — Runtime domain methods (flat on `Page`).
 //!
 //! `callFunctionOn` / `getProperties` / `evaluateHandle` / `onConsole`.
 
+use tokio::sync::broadcast;
 use zuqe_zapi::*;
 
 use crate::{
     class_page::{get_page_client, get_page_session},
-    helpers::{self, promise_json},
-    with_state,
+    helpers::{self, format_exception},
+    require_callback, with_state,
 };
 
 /// `page.callFunctionOn(objectId, fn, args?)`
@@ -35,7 +36,7 @@ pub(crate) fn js_page_call_function_on<'a>(
 
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
-    promise_json(cx, async move {
+    cx.promise_fut_json(async move {
         let val = client
             .send(
                 "Runtime.callFunctionOn",
@@ -44,13 +45,14 @@ pub(crate) fn js_page_call_function_on<'a>(
                     "functionDeclaration": fn_src,
                     "arguments": call_args,
                     "returnByValue": true,
+                    // Without this a returned promise resolves to `null`.
+                    "awaitPromise": true,
                 })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
-        if val.get("exceptionDetails").is_some() {
-            return Err("callFunctionOn: JS exception".to_string());
+            .await?;
+        if let Some(details) = val.get("exceptionDetails") {
+            return Err(format_exception(details));
         }
         Ok(val
             .get("result")
@@ -68,15 +70,14 @@ pub(crate) fn js_page_get_properties<'a>(
     let object_id = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
-    promise_json(cx, async move {
+    cx.promise_fut_json(async move {
         let props = client
             .send(
                 "Runtime.getProperties",
                 Some(serde_json::json!({ "objectId": object_id, "ownProperties": true })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?
+            .await?
             .get("result")
             .and_then(|a| a.as_array())
             .cloned()
@@ -97,7 +98,7 @@ pub(crate) fn js_page_get_properties<'a>(
                 .and_then(|x| x.get("objectId"))
                 .and_then(|x| x.as_str())
             {
-                let r = client
+                client
                     .send(
                         "Runtime.callFunctionOn",
                         Some(serde_json::json!({
@@ -108,15 +109,9 @@ pub(crate) fn js_page_get_properties<'a>(
                         Some(&session_id),
                     )
                     .await
-                    .unwrap_or_else(|_| Ok(serde_json::Value::Null));
-                match r {
-                    Ok(j) => j
-                        .get("result")
-                        .and_then(|x| x.get("value"))
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                    Err(_) => serde_json::Value::Null,
-                }
+                    .ok()
+                    .and_then(|j| j.get("result").and_then(|x| x.get("value")).cloned())
+                    .unwrap_or(serde_json::Value::Null)
             } else {
                 serde_json::Value::Null
             };
@@ -134,7 +129,7 @@ pub(crate) fn js_page_evaluate_handle<'a>(
     let expr = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
-    promise_json(cx, async move {
+    cx.promise_fut_json(async move {
         let val = client
             .send(
                 "Runtime.evaluate",
@@ -144,14 +139,22 @@ pub(crate) fn js_page_evaluate_handle<'a>(
                 })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
-        let obj_id = val
-            .get("result")
+            .await?;
+        if let Some(details) = val.get("exceptionDetails") {
+            return Err(format_exception(details));
+        }
+        let result = val.get("result");
+        let obj_id = result
             .and_then(|x| x.get("objectId"))
             .and_then(|x| x.as_str())
             .unwrap_or("");
-        Ok(serde_json::json!({ "objectId": obj_id }))
+        let mut handle = serde_json::json!({ "objectId": obj_id });
+        // Primitives have no handle; hand the value back so the caller can tell
+        // an empty `objectId` from a real one.
+        if let Some(v) = result.and_then(|x| x.get("value")) {
+            handle["value"] = v.clone();
+        }
+        Ok(handle)
     })
 }
 
@@ -164,14 +167,15 @@ pub(crate) fn js_page_on_console<'a>(
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
 
-    let callback = cc.arg(0).raw();
+    let callback = require_callback(cx, cc.arg(0))?;
     with_state(cx, |st| {
-        st.runtime_console_callbacks.insert(session_id.clone(), callback);
+        st.runtime_console_callbacks
+            .insert(session_id.clone(), callback);
     });
 
     let _ = crate::class_page::send_page_void_cmd(cx, &cc, "Runtime.enable", None);
 
-    let tx = cx.spawn_channel_job("console", move |cx, msg: serde_json::Value| {
+    let tx = cx.spawn_event_job("console", move |cx, msg: serde_json::Value| {
         let sess = msg
             .get("sessionId")
             .and_then(|v| v.as_str())
@@ -185,13 +189,9 @@ pub(crate) fn js_page_on_console<'a>(
             .and_then(|s| with_state(cx, |st| st.runtime_console_callbacks.get(s).copied()));
         if let (Some(cb), Some(_sess)) = (cb, sess)
             && let Ok(obj) = ZqValue::from_json(cx, &params)
-            && ZqValue::from(cb).call(cx, ZqValue::undefined(), &[obj]).is_err()
         {
-            let exc = cx.take_exception();
-            #[cfg(debug_assertions)]
-            helpers::print_exc(cx, exc);
+            cx.call_event_handler(cb, ZqValue::undefined(), &[obj], "console");
         }
-        ZqChannelPoll::Continue
     });
 
     let client_ev = client.clone();
@@ -213,7 +213,12 @@ pub(crate) fn js_page_on_console<'a>(
                     }
                 }
                 Ok(_) => {}
-                Err(_) => break,
+                // Lagging only means this listener missed events, not that the
+                // stream is dead: dropping the receiver would silently kill it.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("CDP console listener lagged by {n} events");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });

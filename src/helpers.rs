@@ -3,14 +3,21 @@
 
 //! Extension-local policy: the tokio runtime backing all CDP async work.
 //!
-//! zapi is deliberately runtime-agnostic (`spawn_promise_async*` takes a
-//! caller-supplied executor), so the extension owns its executor here.
+//! zapi is deliberately runtime-agnostic (`promise_fut_on` takes a caller-supplied
+//! executor), so the extension owns its executor here and hands it to
+//! [`ZqCtx::set_default_executor`] once, at module init. After that every promise
+//! goes through zapi's own `promise_fut*` sugar.
 
 use std::future::Future;
-
-use zuqe_zapi::{ZqCtx, ZqValue};
+use std::pin::Pin;
 
 use crate::cdp;
+
+/// Executor argument for the zapi promise bridge: every async CDP task runs on
+/// the shared tokio runtime.
+pub(crate) fn executor(fut: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+    spawn(fut);
+}
 
 /// Spawn a future on the extension's tokio runtime.
 pub(crate) fn spawn<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
@@ -21,87 +28,35 @@ where
     cdp::runtime().spawn(fut)
 }
 
-/// Executor argument for `ZqCtx::spawn_promise_async*` (all async work runs on
-/// the shared tokio runtime).
-pub(crate) fn executor(
-    fut: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
-) {
-    spawn(fut);
-}
+/// Render a `Runtime.exceptionDetails` payload as the message a JS caller
+/// should see. `text` alone is always the generic `"Uncaught"`; the real
+/// message lives in the exception object's `description`.
+pub(crate) fn format_exception(details: &serde_json::Value) -> String {
+    let exception = details.get("exception");
+    let message = exception
+        .and_then(|e| e.get("description"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            exception
+                .and_then(|e| e.get("value"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.to_string())
+        .or_else(|| {
+            details
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "JS exception".to_string());
 
-/// Bridge an async `Result<T, String>` task to a JS Promise on the shared tokio
-/// runtime. Thin sugar over `ZqCtx::spawn_promise_async_result` that pins the
-/// executor so call sites stay short.
-pub(crate) fn spawn_result<'a, T, F, C>(
-    cx: ZqCtx<'a>,
-    fut: F,
-    convert: C,
-) -> Result<ZqValue<'a>, zuqe_zapi::ZqError>
-where
-    T: Send + 'static,
-    F: Future<Output = Result<T, String>> + Send + 'static,
-    C: for<'b> FnOnce(ZqCtx<'b>, T) -> Result<ZqValue<'b>, zuqe_zapi::ZqError> + Send + 'static,
-{
-    cx.spawn_promise_async_result(fut, executor, convert)
-}
-
-/// Alias for [`spawn_result`] with the context first (reads naturally at call
-/// sites that need a custom convert closure).
-pub(crate) fn promise<'a, T, F, C>(
-    cx: ZqCtx<'a>,
-    fut: F,
-    convert: C,
-) -> Result<ZqValue<'a>, zuqe_zapi::ZqError>
-where
-    T: Send + 'static,
-    F: Future<Output = Result<T, String>> + Send + 'static,
-    C: for<'b> FnOnce(ZqCtx<'b>, T) -> Result<ZqValue<'b>, zuqe_zapi::ZqError> + Send + 'static,
-{
-    spawn_result(cx, fut, convert)
-}
-
-/// Promise resolving to `undefined`.
-pub(crate) fn promise_void<'a>(
-    cx: ZqCtx<'a>,
-    fut: impl Future<Output = Result<(), String>> + Send + 'static,
-) -> Result<ZqValue<'a>, zuqe_zapi::ZqError> {
-    promise(cx, fut, |_cx, ()| Ok(ZqValue::undefined()))
-}
-
-/// Promise resolving to a JS string.
-pub(crate) fn promise_string<'a>(
-    cx: ZqCtx<'a>,
-    fut: impl Future<Output = Result<String, String>> + Send + 'static,
-) -> Result<ZqValue<'a>, zuqe_zapi::ZqError> {
-    promise(cx, fut, |cx, s| ZqValue::new_string(cx, &s))
-}
-
-/// Promise resolving to a JS value built from `serde_json::Value`.
-pub(crate) fn promise_json<'a>(
-    cx: ZqCtx<'a>,
-    fut: impl Future<Output = Result<serde_json::Value, String>> + Send + 'static,
-) -> Result<ZqValue<'a>, zuqe_zapi::ZqError> {
-    promise(cx, fut, |cx, v| ZqValue::from_json(cx, &v))
-}
-
-/// Print a taken JS exception's message under debug builds instead of silently
-/// discarding it. Event callbacks cannot propagate a throw, so this is the only
-/// available diagnostic.
-#[cold]
-#[cfg(debug_assertions)]
-pub(crate) fn print_exc(cx: ZqCtx, exc: ZqValue<'_>) {
-    if exc.is_undefined() {
-        return;
+    match (
+        details.get("lineNumber").and_then(|v| v.as_i64()),
+        details.get("columnNumber").and_then(|v| v.as_i64()),
+    ) {
+        (Some(line), Some(col)) if line > 0 => {
+            format!("{message} (line {line}, column {})", col + 1)
+        }
+        _ => message,
     }
-    let msg = exc
-        .get_str(cx, "message")
-        .ok()
-        .and_then(|v| v.try_string_read_utf8(cx))
-        .unwrap_or_else(|| "<unprintable exception>".to_string());
-    eprintln!("[browser:cleared-exc] {msg}");
 }
-
-/// No-op in release builds (keeps call sites free of `#[cfg]`).
-#[cold]
-#[cfg(not(debug_assertions))]
-pub(crate) fn print_exc(_cx: ZqCtx, _exc: ZqValue<'_>) {}

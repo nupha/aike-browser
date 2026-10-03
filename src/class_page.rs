@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — the main browser tab/page abstraction.
 
@@ -82,8 +82,7 @@ impl JSPage {
         let session_id = get_page_session(cx, cc.this())?;
         let selector_js = selector.replace('\'', "\\'");
 
-        helpers::spawn_result(cx, 
-            async move {
+        cx.promise_fut_result(async move {
                 // Retry with a short per-attempt timeout so that, if `navigate`
                 // returns before the new document is ready, a stale-context
                 // evaluate is retried once the navigation commits.
@@ -108,25 +107,25 @@ impl JSPage {
                          setTimeout(() => {{ mo.disconnect(); reject(new Error('timeout')); }}, {attempt_ms});\
                          }})"
                     );
-                    let rx = client.send(
-                        "Runtime.evaluate",
-                        Some(serde_json::json!({
-                            "expression": js_code,
-                            "awaitPromise": true,
-                        })),
-                        Some(&session_id),
-                    );
-                    match rx.await {
-                        Ok(Ok(val)) => {
-                            if val.get("exceptionDetails").is_some() || val.get("error").is_some() {
-                                tokio::time::sleep(Duration::from_millis(50)).await;
-                                continue;
-                            }
-                            return Ok(());
-                        }
-                        Ok(Err(e)) => return Err(e),
-                        Err(_) => return Err("channel closed".into()),
+                    let val = match client
+                        .send(
+                            "Runtime.evaluate",
+                            Some(serde_json::json!({
+                                "expression": js_code,
+                                "awaitPromise": true,
+                            })),
+                            Some(&session_id),
+                        )
+                        .await
+                    {
+                        Ok(val) => val,
+                        Err(e) => return Err(e),
+                    };
+                    if val.get("exceptionDetails").is_some() {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
                     }
+                    return Ok(());
                 }
             },
             |_cx, ()| Ok(ZqValue::undefined()),
@@ -146,7 +145,7 @@ impl JSPage {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 let js = format!(
                     "new Promise((resolve, reject) => {{\
@@ -161,12 +160,13 @@ impl JSPage {
                      tick();\
                      }})"
                 );
-                let rx = client.send(
-                    "Runtime.evaluate",
-                    Some(serde_json::json!({ "expression": js, "awaitPromise": true })),
-                    Some(&session_id),
-                );
-                let val = rx.await.unwrap_or_else(|_| Err("channel closed".into()))?;
+                let val = client
+                    .send(
+                        "Runtime.evaluate",
+                        Some(serde_json::json!({ "expression": js, "awaitPromise": true })),
+                        Some(&session_id),
+                    )
+                    .await?;
                 if val.get("exceptionDetails").is_some() {
                     Err("waitForFunction: condition not met or timed out".to_string())
                 } else {
@@ -184,33 +184,36 @@ impl JSPage {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
-                let rx = client.send(
-                    "Runtime.evaluate",
-                    Some(serde_json::json!({
-                        "expression": js_code,
-                        "awaitPromise": true,
-                        "returnByValue": true,
-                    })),
-                    Some(&session_id),
-                );
-                let val = rx.await.unwrap_or_else(|_| Err("channel closed".into()))?;
+                let val = client
+                    .send(
+                        "Runtime.evaluate",
+                        Some(serde_json::json!({
+                            "expression": js_code,
+                            "awaitPromise": true,
+                            "returnByValue": true,
+                        })),
+                        Some(&session_id),
+                    )
+                    .await?;
                 if let Some(exception) = val.get("exceptionDetails") {
-                    let text = exception
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("JS exception")
-                        .to_string();
-                    return Err(text);
+                    return Err(helpers::format_exception(exception));
                 }
-                if let Some(result) = val.get("result") {
-                    if let Some(value) = result.get("value") {
-                        return Ok(Some(value.clone()));
-                    }
-                    if let Some(desc) = result.get("description").and_then(|v| v.as_str()) {
-                        return Ok(Some(serde_json::Value::String(desc.to_string())));
-                    }
+                let result = val.get("result");
+                if let Some(value) = result.and_then(|r| r.get("value")) {
+                    return Ok(Some(value.clone()));
+                }
+                // NaN, Infinity, BigInt and friends carry no `value`; reading
+                // `description` alone would turn them into an opaque string.
+                if let Some(unserializable) = result.and_then(|r| r.get("unserializableValue")) {
+                    return Ok(Some(unserializable.clone()));
+                }
+                if let Some(desc) = result
+                    .and_then(|r| r.get("description"))
+                    .and_then(|v| v.as_str())
+                {
+                    return Ok(Some(serde_json::Value::String(desc.to_string())));
                 }
                 Ok(None)
             },
@@ -226,7 +229,7 @@ impl JSPage {
     fn get_outer_html<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 let val = client
                     .send(
@@ -236,8 +239,7 @@ impl JSPage {
                         })),
                         Some(&session_id),
                     )
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
+                    .await?;
                 Ok(val
                     .get("result")
                     .and_then(|r| r.get("value"))
@@ -259,14 +261,16 @@ impl JSPage {
         let mut from_surface = None::<bool>;
         let mut optimize_for_speed = None::<bool>;
 
-        if cc.len() > 0 && let Some(opts) = cc.arg(0).as_object() {
+        if cc.len() > 0
+            && let Some(opts) = cc.arg(0).as_object()
+        {
             if let Some(f) = get_str_prop(cx, &opts, "format") {
                 format = f;
             }
             if let Some(q) = get_number_prop(cx, &opts, "quality") {
                 quality = Some(q as i32);
             }
-            if let Ok(Some(clip_obj)) = opts.get_object_str(cx, "clip")
+            if let Some(clip_obj) = get_object_prop(cx, &opts, "clip")
                 && let (Some(x), Some(y), Some(w), Some(h)) = (
                     get_number_prop(cx, &clip_obj, "x"),
                     get_number_prop(cx, &clip_obj, "y"),
@@ -297,7 +301,7 @@ impl JSPage {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 let mut params = serde_json::json!({ "format": format });
                 if let Some(q) = quality {
@@ -317,8 +321,7 @@ impl JSPage {
                 }
                 let val = client
                     .send("Page.captureScreenshot", Some(params), Some(&session_id))
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
+                    .await?;
                 let b64 = val
                     .get("data")
                     .and_then(|v| v.as_str())
@@ -365,7 +368,7 @@ impl JSPage {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 let _ = client.send("Page.enable", None, Some(&session_id)).await;
                 let mut event_rx = client.subscribe_events();
@@ -408,7 +411,7 @@ impl JSPage {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 let mut params = serde_json::json!({ "accept": accept });
                 if let Some(text) = prompt_text {
@@ -420,8 +423,7 @@ impl JSPage {
                         Some(params),
                         Some(&session_id),
                     )
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
+                    .await?;
                 Ok(())
             },
             |_cx, ()| Ok(ZqValue::undefined()),
@@ -432,7 +434,9 @@ impl JSPage {
     #[zq_method(name = "printToPDF")]
     fn print_to_pdf<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let mut params = serde_json::json!({ "printBackground": true });
-        if cc.len() > 0 && let Some(opts) = cc.arg(0).as_object() {
+        if cc.len() > 0
+            && let Some(opts) = cc.arg(0).as_object()
+        {
             if let Some(v) = get_bool_prop(cx, &opts, "landscape") {
                 params["landscape"] = serde_json::Value::Bool(v);
             }
@@ -449,12 +453,11 @@ impl JSPage {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 let val = client
                     .send("Page.printToPDF", Some(params), Some(&session_id))
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
+                    .await?;
                 let b64 = val
                     .get("data")
                     .and_then(|v| v.as_str())
@@ -479,7 +482,11 @@ impl JSPage {
             && let Ok(len) = arr.length(cx)
         {
             for i in 0..len {
-                if let Some(s) = arr.get_index(cx, i as u32).ok().and_then(|x| x.try_string_read_utf8(cx)) {
+                if let Some(s) = arr
+                    .get_index(cx, i as u32)
+                    .ok()
+                    .and_then(|x| x.try_string_read_utf8(cx))
+                {
                     file_paths.push(s);
                 }
             }
@@ -488,45 +495,20 @@ impl JSPage {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
-                let set_files_js = file_paths
-                    .iter()
-                    .map(|p| {
-                        format!(
-                            "dt.items.add(new File([new Blob()], '{}'))",
-                            p.replace('\'', "\\'")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(";\n");
-
-                let js_code = format!(
-                    "(() => {{\
-                     const input = document.querySelector('{}');\
-                     if (!input) throw new Error('input not found');\
-                     const dt = new DataTransfer();\
-                     {};\
-                     input.files = dt.files;\
-                     input.dispatchEvent(new Event('change', {{ bubbles: true }}));\
-                     }})()",
-                    selector.replace('\'', "\\'"),
-                    set_files_js,
-                );
-
-                let val = client
+                // `DOM.setFileInputFiles` hands the input the real files; building
+                // a `DataTransfer` in page script produced empty `File` objects
+                // named after the whole path.
+                let node_id = crate::dom::resolve_selector(&client, &session_id, &selector).await?;
+                client
                     .send(
-                        "Runtime.evaluate",
-                        Some(serde_json::json!({ "expression": js_code })),
+                        "DOM.setFileInputFiles",
+                        Some(serde_json::json!({ "files": file_paths, "nodeId": node_id })),
                         Some(&session_id),
                     )
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
-                if val.get("exceptionDetails").is_some() {
-                    Err("upload: JS exception".to_string())
-                } else {
-                    Ok(())
-                }
+                    .await?;
+                Ok(())
             },
             |_cx, ()| Ok(ZqValue::undefined()),
         )
@@ -537,12 +519,11 @@ impl JSPage {
     fn get_layout_metrics<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 client
                     .send("Page.getLayoutMetrics", None, Some(&session_id))
                     .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))
             },
             |cx, v: serde_json::Value| ZqValue::from_json(cx, &v),
         )
@@ -554,7 +535,7 @@ impl JSPage {
         let source = cc.arg(0).coerce_string(cx).unwrap_or_default();
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 let val = client
                     .send(
@@ -562,8 +543,7 @@ impl JSPage {
                         Some(serde_json::json!({ "source": source })),
                         Some(&session_id),
                     )
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
+                    .await?;
                 Ok(val
                     .get("identifier")
                     .and_then(|v| v.as_str())
@@ -579,12 +559,11 @@ impl JSPage {
     fn get_frame_tree<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 client
                     .send("Page.getFrameTree", None, Some(&session_id))
                     .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))
             },
             |cx, v: serde_json::Value| ZqValue::from_json(cx, &v),
         )
@@ -626,7 +605,7 @@ impl JSPage {
         let payload = get_page_payload(cx, cc.this())?;
         let client = payload.client.clone();
         let target_id = payload.target_id.clone();
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move { client.close_target(&target_id).await },
             |_cx, ()| Ok(ZqValue::undefined()),
         )
@@ -641,16 +620,14 @@ impl JSPage {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
 
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 let tree = client
                     .send("Page.getFrameTree", None, Some(&session_id))
                     .await
-                    .unwrap_or_else(|_| Ok(serde_json::Value::Null));
+                    .unwrap_or(serde_json::Value::Null);
                 let frame_id = tree
-                    .as_ref()
-                    .ok()
-                    .and_then(|v| v.get("frameTree"))
+                    .get("frameTree")
                     .and_then(|ft| ft.get("frame"))
                     .and_then(|f| f.get("id"))
                     .and_then(|v| v.as_str())
@@ -663,8 +640,7 @@ impl JSPage {
                                 Some(serde_json::json!({ "frameId": fid, "html": html })),
                                 Some(&session_id),
                             )
-                            .await
-                            .unwrap_or_else(|_| Err("channel closed".into()))?;
+                            .await?;
                         Ok(())
                     }
                     None => Err("setContent: cannot resolve main frame".to_string()),
@@ -713,12 +689,11 @@ impl JSPage {
     ) -> Result<ZqValue<'a>, ZqError> {
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 client
                     .send("Page.getNavigationHistory", None, Some(&session_id))
                     .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))
             },
             |cx, v: serde_json::Value| ZqValue::from_json(cx, &v),
         )
@@ -742,12 +717,11 @@ impl JSPage {
         }
         let client = get_page_client(cx, cc.this())?;
         let session_id = get_page_session(cx, cc.this())?;
-        helpers::spawn_result(cx, 
+        cx.promise_fut_result(
             async move {
                 let val = client
                     .send("Page.captureSnapshot", Some(params), Some(&session_id))
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
+                    .await?;
                 Ok(val
                     .get("data")
                     .and_then(|v| v.as_str())
@@ -756,21 +730,6 @@ impl JSPage {
             },
             |cx, data: String| ZqValue::new_string(cx, &data),
         )
-    }
-
-    /// `page.setDownloadBehavior(path)`
-    #[zq_method(name = "setDownloadBehavior")]
-    fn set_download_behavior<'a>(
-        cx: ZqCtx<'a>,
-        cc: ZqCallInfo<'a>,
-    ) -> Result<ZqValue<'a>, ZqError> {
-        let path = cc.arg(0).coerce_string(cx).unwrap_or_default();
-        let params = if path.is_empty() {
-            serde_json::json!({ "behavior": "deny" })
-        } else {
-            serde_json::json!({ "behavior": "allow", "downloadPath": path })
-        };
-        send_page_void_cmd(cx, &cc, "Page.setDownloadBehavior", Some(params))
     }
 
     /// `page.setBypassCSP(enabled)`
@@ -964,12 +923,18 @@ impl JSPage {
     }
 
     #[zq_method(name = "getRequestPostData")]
-    fn get_request_post_data<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
+    fn get_request_post_data<'a>(
+        cx: ZqCtx<'a>,
+        cc: ZqCallInfo<'a>,
+    ) -> Result<ZqValue<'a>, ZqError> {
         network::js_page_get_request_post_data(cx, cc)
     }
 
     #[zq_method(name = "startNetworkCapture")]
-    fn start_network_capture<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
+    fn start_network_capture<'a>(
+        cx: ZqCtx<'a>,
+        cc: ZqCallInfo<'a>,
+    ) -> Result<ZqValue<'a>, ZqError> {
         network::js_page_start_network_capture(cx, cc)
     }
 
@@ -979,7 +944,10 @@ impl JSPage {
     }
 
     #[zq_method(name = "getCapturedRequests")]
-    fn get_captured_requests<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
+    fn get_captured_requests<'a>(
+        cx: ZqCtx<'a>,
+        cc: ZqCallInfo<'a>,
+    ) -> Result<ZqValue<'a>, ZqError> {
         network::js_page_get_captured_requests(cx, cc)
     }
 
@@ -1137,12 +1105,9 @@ pub(crate) fn send_page_void_cmd<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    helpers::spawn_result(cx, 
+    cx.promise_fut_result(
         async move {
-            client
-                .send(method, params, Some(&session_id))
-                .await
-                .unwrap_or_else(|_| Err("channel closed".into()))?;
+            client.send(method, params, Some(&session_id)).await?;
             Ok(())
         },
         |_cx, ()| Ok(ZqValue::undefined()),
@@ -1153,16 +1118,52 @@ pub(crate) fn send_page_void_cmd<'a>(
 // Utility helpers
 // ---------------------------------------------------------------------------
 
+/// Optional-property readers. Each swallows the exception a throwing getter or
+/// a wrong-typed value leaves behind (`ZqValue::try_get_*`), because "not
+/// provided" is a normal answer for an options bag and must not survive the call.
+///
+/// The one-line aliases stay because they read better at the ~60 call sites than
+/// `opts.try_get_string_str(cx, "format")`.
 pub(crate) fn get_str_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Option<String> {
-    obj.get_string_str(cx, key).ok().flatten()
+    obj.try_get_string_str(cx, key)
 }
 
 pub(crate) fn get_number_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Option<f64> {
-    obj.get_f64_str(cx, key).ok().flatten()
+    obj.try_get_f64_str(cx, key)
 }
 
 pub(crate) fn get_bool_prop(cx: ZqCtx, obj: &ZqValue, key: &str) -> Option<bool> {
-    obj.get_bool_str(cx, key).ok().flatten()
+    obj.try_get_bool_str(cx, key)
+}
+
+/// Optional nested object property; `None` when absent, nullish or not an object.
+pub(crate) fn get_object_prop<'a>(
+    cx: ZqCtx<'a>,
+    obj: &ZqValue<'a>,
+    key: &str,
+) -> Option<ZqValue<'a>> {
+    obj.try_get_object_str(cx, key)
+}
+
+/// Optional nested array property; `None` when absent, nullish or not an array.
+pub(crate) fn get_array_prop<'a>(
+    cx: ZqCtx<'a>,
+    obj: &ZqValue<'a>,
+    key: &str,
+) -> Option<ZqValue<'a>> {
+    obj.try_get_array_str(cx, key)
+}
+
+/// Optional enum-valued property, validated against `allowed` (`None` when
+/// absent). Throws a `RangeError` naming the property, the rejected value and
+/// the full set when the value is not a member.
+pub(crate) fn get_enum_prop(
+    cx: ZqCtx,
+    obj: &ZqValue,
+    key: &str,
+    allowed: &[&str],
+) -> Result<Option<String>, ZqError> {
+    obj.get_enum(cx, key, allowed)
 }
 
 /// Shared helper for `back()` / `forward()`: step `delta` entries through the
@@ -1175,12 +1176,11 @@ fn navigate_history<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    helpers::spawn_result(cx, 
+    cx.promise_fut_result(
         async move {
             let hist = client
                 .send("Page.getNavigationHistory", None, Some(&session_id))
-                .await
-                .unwrap_or_else(|_| Err("channel closed".into()))?;
+                .await?;
             let current = hist
                 .get("currentIndex")
                 .and_then(|v| v.as_i64())
@@ -1200,8 +1200,7 @@ fn navigate_history<'a>(
                     Some(serde_json::json!({ "entryId": entry_id })),
                     Some(&session_id),
                 )
-                .await
-                .unwrap_or_else(|_| Err("channel closed".into()))?;
+                .await?;
             Ok(())
         },
         |_cx, ()| Ok(ZqValue::undefined()),

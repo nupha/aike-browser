@@ -12,7 +12,6 @@ zuqe_zapi = { path = "../zuqe-zapi", features = ["serde_json_support"] }
 zuqe_zapi_macros = { path = "../zuqe-zapi-macros" }
 serde_json = "1"
 base64 = "0.22"
-crossbeam-channel = "0.5"
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",

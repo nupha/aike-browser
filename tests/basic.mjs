@@ -120,8 +120,10 @@ async function main() {
   await page.setBypassCSP(false);
   check("setBypassCSP(true/false) resolves", true);
 
-  await page.setDownloadBehavior(tmpDir);
-  await page.setDownloadBehavior("");
+  // Download behavior is a browser-level setting; the page-level
+  // `Page.setDownloadBehavior` command is deprecated.
+  await browser.setDownloadBehavior(tmpDir);
+  await browser.setDownloadBehavior("");
   check("setDownloadBehavior(allow/deny) resolves", true);
 
   await page.bringToFront();

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — Tracing domain (flat on `Page`).
 
@@ -10,7 +10,6 @@ use zuqe_zapi::*;
 
 use crate::{
     class_page::{get_page_client, get_page_session},
-    helpers::{promise_string, promise_void},
     io::read_io_stream,
 };
 
@@ -26,7 +25,7 @@ pub(crate) fn js_page_start_tracing<'a>(
     };
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         let mut params = serde_json::json!({
             "bufferUsageReportingInterval": 0,
             "transferMode": "ReturnAsStream",
@@ -38,8 +37,7 @@ pub(crate) fn js_page_start_tracing<'a>(
         }
         client
             .send("Tracing.start", Some(params), Some(&session_id))
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         Ok(())
     })
 }
@@ -51,7 +49,7 @@ pub(crate) fn js_page_stop_tracing<'a>(
 ) -> Result<ZqValue<'a>, ZqError> {
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
-    promise_string(cx, async move {
+    cx.promise_fut_string(async move {
         let _ = client.send("Tracing.end", None, Some(&session_id)).await;
 
         let mut event_rx = client.subscribe_events();
@@ -84,7 +82,9 @@ pub(crate) fn js_page_stop_tracing<'a>(
         }
 
         Ok(match stream_handle {
-            Some(h) => read_io_stream(&client, &session_id, &h).await.unwrap_or_default(),
+            Some(h) => read_io_stream(&client, &session_id, &h)
+                .await
+                .unwrap_or_default(),
             None => String::new(),
         })
     })

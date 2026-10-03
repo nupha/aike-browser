@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — Overlay domain methods (flat on `Page`).
 
@@ -8,7 +8,6 @@ use zuqe_zapi::*;
 use crate::{
     class_page::{get_page_client, get_page_session, send_page_void_cmd},
     dom,
-    helpers::promise_void,
 };
 
 /// Default highlight config: a translucent blue content box plus borders.
@@ -31,7 +30,7 @@ pub(crate) fn js_page_highlight<'a>(
     let config = default_highlight_config();
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         // Best-effort highlight: mirrors the built-in module, which ignores the
         // CDP outcome of `Overlay.highlightNode` (a selector may resolve while
         // the node is not paintable).

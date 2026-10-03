@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Browser class — the top-level browser instance.
 //!
@@ -15,14 +15,17 @@ use zuqe_zapi_macros::{zq_class, zq_class_impl, zq_method, zq_static_method};
 use crate::{
     cdp, chrome,
     class_page::{
-        JSPage, PageNetworkState, PagePayload, get_bool_prop, get_number_prop, get_str_prop,
+        JSPage, PageNetworkState, PagePayload, get_array_prop, get_bool_prop, get_enum_prop,
+        get_number_prop, get_str_prop,
     },
-    helpers,
 };
 
 /// How long `close()` / a failed launch waits for Chrome to actually exit
 /// before giving up on reaping it.
 const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `Browser.WindowState` values.
+const WINDOW_STATES: &[&str] = &["normal", "minimized", "maximized", "fullscreen"];
 
 /// Payload attached to every `Browser` instance.
 pub(crate) struct BrowserPayload {
@@ -103,7 +106,7 @@ impl JSBrowser {
             if let Some(h) = get_bool_prop(cx, &opts, "headless") {
                 headless = h;
             }
-            if let Ok(Some(arr)) = opts.get_array_str(cx, "args")
+            if let Some(arr) = get_array_prop(cx, &opts, "args")
                 && let Ok(len) = arr.length(cx)
             {
                 let mut out = Vec::with_capacity(len);
@@ -119,8 +122,7 @@ impl JSBrowser {
             return Err(cx.throw_type("`spawn`: `args` requires `bin`"));
         }
 
-        helpers::spawn_result(
-            cx,
+        cx.promise_fut_result(
             async move {
                 let s = chrome::spawn(
                     bin.as_deref(),
@@ -171,8 +173,7 @@ impl JSBrowser {
         }
 
         let client_cb = client.clone();
-        helpers::spawn_result(
-            cx,
+        cx.promise_fut_result(
             async move {
                 let mut params = serde_json::json!({ "url": url });
                 if let Some(cid) = context_id {
@@ -180,8 +181,7 @@ impl JSBrowser {
                 }
                 let resp = client
                     .send("Target.createTarget", Some(params), None)
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
+                    .await?;
                 let target_id = resp
                     .get("targetId")
                     .and_then(|x| x.as_str())
@@ -194,8 +194,7 @@ impl JSBrowser {
                         Some(serde_json::json!({ "targetId": target_id, "flatten": true })),
                         None,
                     )
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
+                    .await?;
                 let session_id = attach
                     .get("sessionId")
                     .and_then(|x| x.as_str())
@@ -234,8 +233,7 @@ impl JSBrowser {
         let client = payload.client.clone();
         let chrome_child = payload.chrome_child.clone();
         let user_data_dir = payload.user_data_dir.clone();
-        helpers::spawn_result(
-            cx,
+        cx.promise_fut_result(
             async move {
                 // Attach mode (no child process): don't send `Browser.close`.
                 let owns_process = chrome_child
@@ -281,14 +279,8 @@ impl JSBrowser {
     #[zq_method(name = "getVersion")]
     fn get_version<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let client = get_browser_payload(cx, cc.this())?.client.clone();
-        helpers::spawn_result(
-            cx,
-            async move {
-                client
-                    .send("Browser.getVersion", None, None)
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))
-            },
+        cx.promise_fut_result(
+            async move { client.send("Browser.getVersion", None, None).await },
             |cx, v: serde_json::Value| ZqValue::from_json(cx, &v),
         )
     }
@@ -297,8 +289,7 @@ impl JSBrowser {
     #[zq_method(name = "getWindowBounds")]
     fn get_window_bounds<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
         let client = get_browser_payload(cx, cc.this())?.client.clone();
-        helpers::spawn_result(
-            cx,
+        cx.promise_fut_result(
             async move {
                 let wid = browser_window_id(&client).await?;
                 client
@@ -308,7 +299,6 @@ impl JSBrowser {
                         None,
                     )
                     .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))
             },
             |cx, v: serde_json::Value| ZqValue::from_json(cx, &v),
         )
@@ -333,14 +323,15 @@ impl JSBrowser {
             if let Some(v) = get_number_prop(cx, &obj, "height") {
                 bounds.insert("height".into(), serde_json::Value::from(v as i32));
             }
-            if let Some(s) = get_str_prop(cx, &obj, "windowState") {
-                bounds.insert("windowState".into(), serde_json::Value::String(s));
+            // An unknown state is not merely a rejected command: Chrome aborts the
+            // whole browser process, taking every page with it. Validate first.
+            if let Some(state) = get_enum_prop(cx, &obj, "windowState", WINDOW_STATES)? {
+                bounds.insert("windowState".into(), serde_json::Value::String(state));
             }
         }
 
         let client = get_browser_payload(cx, cc.this())?.client.clone();
-        helpers::spawn_result(
-            cx,
+        cx.promise_fut_result(
             async move {
                 let wid = browser_window_id(&client).await?;
                 client
@@ -349,8 +340,7 @@ impl JSBrowser {
                         Some(serde_json::json!({ "windowId": wid, "bounds": bounds })),
                         None,
                     )
-                    .await
-                    .unwrap_or_else(|_| Err("channel closed".into()))?;
+                    .await?;
                 Ok(())
             },
             |_cx, ()| Ok(ZqValue::undefined()),
@@ -449,8 +439,7 @@ fn browser_promise<'a>(cx: ZqCtx<'a>, req: LaunchRequest) -> Result<ZqValue<'a>,
         cdp_url,
     } = req;
 
-    helpers::spawn_result(
-        cx,
+    cx.promise_fut_result(
         async move {
             if let Some(url) = cdp_url {
                 cdp::CdpClient::connect(&url)
@@ -533,8 +522,7 @@ impl JSBrowserProcess {
             .ok_or_else(|| cx.throw_type("not a BrowserProcess instance"))?;
         let child = payload.child.clone();
         let user_data_dir = payload.user_data_dir.clone();
-        helpers::spawn_result(
-            cx,
+        cx.promise_fut_result(
             async move {
                 let mut guard = child.lock().await;
                 if let Some(mut child) = guard.take() {
@@ -601,13 +589,9 @@ pub(crate) fn send_browser_void_cmd<'a>(
     params: Option<serde_json::Value>,
 ) -> Result<ZqValue<'a>, ZqError> {
     let client = get_browser_payload(cx, cc.this())?.client.clone();
-    helpers::spawn_result(
-        cx,
+    cx.promise_fut_result(
         async move {
-            client
-                .send(method, params, None)
-                .await
-                .unwrap_or_else(|_| Err("channel closed".into()))?;
+            client.send(method, params, None).await?;
             Ok(())
         },
         |_cx, ()| Ok(ZqValue::undefined()),
@@ -615,17 +599,17 @@ pub(crate) fn send_browser_void_cmd<'a>(
 }
 
 /// Resolve the browser's main window id via `Browser.getWindowForTarget`.
-async fn browser_window_id(client: &cdp::CdpClient) -> Result<String, String> {
+async fn browser_window_id(client: &cdp::CdpClient) -> Result<i64, String> {
     let resp = client
         .send(
             "Browser.getWindowForTarget",
             Some(serde_json::json!({})),
             None,
         )
-        .await
-        .unwrap_or_else(|_| Err("channel closed".into()))?;
+        .await?;
+    // `Browser.WindowId` is an integer, not a string: reading it as one made
+    // every window method fail with "no windowId".
     resp.get("windowId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .and_then(|v| v.as_i64())
         .ok_or_else(|| "no windowId".to_string())
 }

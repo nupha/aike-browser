@@ -18,6 +18,12 @@ test: build
 	$(AIKE) -m tests/regression_launch_race.mjs
 	$(AIKE) -m tests/regression_launch_failure_cleanup.mjs
 	$(AIKE) -m tests/regression_profile_dir_cleanup.mjs
+	$(AIKE) -m tests/regression_p0_fetch.mjs
+	$(AIKE) -m tests/regression_p0_input.mjs
+	$(AIKE) -m tests/regression_p0_runtime.mjs
+	$(AIKE) -m tests/regression_p0_network.mjs
+	$(AIKE) -m tests/regression_p0_window.mjs
+	$(AIKE) -m tests/regression_p0_event_exit.mjs
 
 clean:
 	mbx clean

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — Network domain methods (cookies, capture, response body).
 
@@ -12,9 +12,15 @@ use zuqe_zapi::*;
 
 use crate::{
     cdp_network,
-    class_page::{get_bool_prop, get_page_payload, get_str_prop, send_page_void_cmd},
+    class_page::{
+        get_bool_prop, get_enum_prop, get_number_prop, get_page_payload, get_str_prop,
+        send_page_void_cmd,
+    },
     helpers,
 };
+
+/// `Network.CookieSameSite` values.
+const COOKIE_SAME_SITE: &[&str] = &["Strict", "Lax", "None"];
 
 /// Convert a CDP cookie JSON value to a JS object.
 fn cookie_to_js<'a>(cx: ZqCtx<'a>, c: &serde_json::Value) -> Result<ZqValue<'a>, ZqError> {
@@ -45,10 +51,9 @@ pub(crate) fn js_page_get_cookies<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    helpers::spawn_result(cx, 
+    cx.promise_fut_result(
         async move {
-            let rx = cdp_network::get_all_cookies(&client, &session_id);
-            let val = rx.await.unwrap_or_else(|_| Err("channel closed".into()))?;
+            let val = cdp_network::get_cookies(&client, &session_id).await?;
             Ok(val
                 .get("cookies")
                 .and_then(|v| v.as_array())
@@ -83,16 +88,28 @@ pub(crate) fn js_page_set_cookie<'a>(
             params.insert(key.into(), serde_json::Value::String(v));
         }
     }
+    // The flag/attribute fields `Network.setCookie` accepts but a name/value
+    // pair does not carry: dropping them silently stored a different cookie.
+    for key in ["httpOnly", "secure"] {
+        if let Some(v) = get_bool_prop(cx, &cookie, key) {
+            params.insert(key.into(), serde_json::Value::Bool(v));
+        }
+    }
+    if let Some(same_site) = get_enum_prop(cx, &cookie, "sameSite", COOKIE_SAME_SITE)? {
+        params.insert("sameSite".into(), serde_json::Value::String(same_site));
+    }
+    if let Some(expires) = get_number_prop(cx, &cookie, "expires") {
+        params.insert("expires".into(), serde_json::json!(expires));
+    }
 
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    helpers::spawn_result(cx, 
+    cx.promise_fut_result(
         async move {
             let _ = cdp_network::enable_network(&client, &session_id).await;
-            let rx =
-                cdp_network::set_cookie(&client, &session_id, serde_json::Value::Object(params));
-            rx.await.unwrap_or_else(|_| Err("channel closed".into()))?;
+            cdp_network::set_cookie(&client, &session_id, serde_json::Value::Object(params))
+                .await?;
             Ok(())
         },
         |_cx, ()| Ok(ZqValue::undefined()),
@@ -138,6 +155,10 @@ pub(crate) fn js_page_set_extra_http_headers<'a>(
 }
 
 /// `page.setOfflineMode(bool)`
+///
+/// `Network.overrideNetworkState` replaces the deprecated
+/// `Network.emulateNetworkConditions`; `emulateNetworkConditionsByRule` is the
+/// other half of that migration and only matters for per-URL rules.
 pub(crate) fn js_page_set_offline_mode<'a>(
     cx: ZqCtx<'a>,
     cc: ZqCallInfo<'a>,
@@ -146,7 +167,7 @@ pub(crate) fn js_page_set_offline_mode<'a>(
     send_page_void_cmd(
         cx,
         &cc,
-        "Network.emulateNetworkConditions",
+        "Network.overrideNetworkState",
         Some(serde_json::json!({
             "offline": offline,
             "latency": 0,
@@ -244,11 +265,8 @@ pub(crate) fn js_page_get_response_body<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    helpers::spawn_result(cx, 
-        async move {
-            let rx = cdp_network::get_response_body(&client, &session_id, &request_id);
-            rx.await.unwrap_or_else(|_| Err("channel closed".into()))
-        },
+    cx.promise_fut_result(
+        async move { cdp_network::get_response_body(&client, &session_id, &request_id).await },
         |cx, v: serde_json::Value| ZqValue::from_json(cx, &v),
     )
 }
@@ -263,10 +281,9 @@ pub(crate) fn js_page_start_network_capture<'a>(
     let session_id = payload.session_id.clone();
     let network = payload.network.clone();
 
-    helpers::spawn_result(cx, 
+    cx.promise_fut_result(
         async move {
-            let rx = cdp_network::enable_network(&client, &session_id);
-            rx.await.unwrap_or_else(|_| Err("channel closed".into()))?;
+            cdp_network::enable_network(&client, &session_id).await?;
 
             let running = Arc::new(AtomicBool::new(true));
             let captured = network.captured_requests.clone();
@@ -354,7 +371,7 @@ pub(crate) fn js_page_get_request_post_data<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    helpers::spawn_result(cx, 
+    cx.promise_fut_result(
         async move {
             let _ = cdp_network::enable_network(&client, &session_id).await;
             let val = client
@@ -363,8 +380,7 @@ pub(crate) fn js_page_get_request_post_data<'a>(
                     Some(serde_json::json!({ "requestId": request_id })),
                     Some(&session_id),
                 )
-                .await
-                .unwrap_or_else(|_| Err("channel closed".into()))?;
+                .await?;
             Ok(val
                 .get("postData")
                 .and_then(|v| v.as_str())

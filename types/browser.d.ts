@@ -106,7 +106,12 @@ declare module "browser" {
       top?: number;
       width?: number;
       height?: number;
-      windowState?: string;
+      /**
+       * One of `"normal"`, `"minimized"`, `"maximized"`, `"fullscreen"`.
+       * Anything else throws a RangeError (Chrome aborts the browser process
+       * on an unknown state).
+       */
+      windowState?: "normal" | "minimized" | "maximized" | "fullscreen";
     }): Promise<void>;
 
     /** Set global download behavior. Empty path → "deny", otherwise "allow". */
@@ -133,8 +138,20 @@ declare module "browser" {
     /** Ignore HTTPS certificate errors. */
     setIgnoreHTTPSErrors(enabled: boolean): Promise<void>;
 
-    /** Handle a pending certificate error. */
-    handleCertificateError(payload: any): Promise<void>;
+    /**
+     * Register a callback for `Security.certificateError` events. The callback
+     * receives `{ eventId, errorType, requestURL, accept }`; `accept(true)`
+     * turns certificate-error ignoring on (the deprecated per-event
+     * `continue`/`cancel` action is gone).
+     */
+    handleCertificateError(
+      callback: (event: {
+        eventId: number;
+        errorType?: string;
+        requestURL?: string;
+        accept(enabled: boolean): void;
+      }) => void,
+    ): void;
   }
 
   // =========================================================================
@@ -194,7 +211,9 @@ declare module "browser" {
     /**
      * Execute JavaScript code in the page context.
      * @param jsCode - JavaScript source to evaluate.
-     * @returns The JSON-serialized result.
+     * @returns The JSON-serialized result, or its `unserializableValue` string
+     *   form for values JSON cannot represent (NaN, Infinity, BigInt).
+     *   Rejects with the thrown error's message when the code throws.
      */
     evaluate(jsCode: string): Promise<any>;
 
@@ -246,8 +265,12 @@ declare module "browser" {
     enableRuntime(): Promise<void>;
 
     // ---- Runtime: remote objects ----
-    /** Evaluate an expression and return a handle `{ objectId }` referencing the result. */
-    evaluateHandle(expression: string): Promise<{ objectId: string }>;
+    /**
+     * Evaluate an expression and return a handle `{ objectId }` referencing the
+     * result. A primitive result has no handle: `objectId` is then `""` and
+     * `value` carries the primitive.
+     */
+    evaluateHandle(expression: string): Promise<{ objectId: string; value?: any }>;
 
     /**
      * Enumerate an object's own properties by its CDP `objectId`.
@@ -319,9 +342,6 @@ declare module "browser" {
     handleDialog(accept: boolean, promptText?: string): Promise<void>;
 
     // ---- Download ----
-    /** Set per-page download behavior. Empty path → "deny", otherwise "allow". */
-    setDownloadBehavior(path: string): Promise<void>;
-
     /** Set whether to bypass Content-Security-Policy. */
     setBypassCSP(enabled: boolean): Promise<void>;
 
@@ -408,8 +428,13 @@ declare module "browser" {
     mouseUp(x: number, y: number, options?: MouseClickOptions): Promise<void>;
 
     /**
-     * Simulate pressing a key (keyDown → char → keyUp).
-     * Uses native CDP Input.dispatchKeyEvent.
+     * Simulate pressing a key (keyDown → keyUp).
+     * Uses native CDP Input.dispatchKeyEvent. Accepts a single printable
+     * character or a named key (`"Enter"`, `"Tab"`, `"Escape"`, `"Backspace"`,
+     * `"ArrowLeft"` … `"ArrowDown"`, `"Home"`, `"End"`, `"PageUp"`,
+     * `"PageDown"`, `"Insert"`, `"Delete"`, `"Shift"`, `"Control"`, `"Alt"`,
+     * `"Meta"`, `"CapsLock"`, `"F1"`…`"F12"`); anything else throws a
+     * TypeError.
      */
     keyPress(key: string, options?: KeyPressOptions): Promise<void>;
 
@@ -420,23 +445,65 @@ declare module "browser" {
     insertText(text: string): Promise<void>;
 
     // ---- Request interception (Fetch domain) ----
-    /** Enable / disable request interception. */
+    /**
+     * Enable / disable request interception. While enabled every request is
+     * paused and `onRequestPaused` fires; a request the callback does not
+     * explicitly continue / abort / fulfill is released automatically.
+     */
     setRequestInterception(enabled: boolean): Promise<void>;
 
-    /** Continue a paused request by its interceptionId. */
-    continueRequest(interceptionId: string): Promise<void>;
+    /**
+     * Continue a paused request by its interceptionId.
+     * @param opts - `url`, `method`, `headers` (`Record<string,string>`) and
+     *   `postData` (plain text; base64-encoded on the wire for you).
+     */
+    continueRequest(
+      interceptionId: string,
+      opts?: {
+        url?: string;
+        method?: string;
+        headers?: Record<string, string>;
+        postData?: string;
+      },
+    ): Promise<void>;
 
-    /** Abort a paused request by its interceptionId. */
-    abortRequest(interceptionId: string): Promise<void>;
+    /**
+     * Abort a paused request by its interceptionId.
+     * @param reason - A `Network.ErrorReason` value; anything else throws a
+     *   RangeError.
+     */
+    abortRequest(
+      interceptionId: string,
+      reason?:
+        | "Failed"
+        | "Aborted"
+        | "TimedOut"
+        | "AccessDenied"
+        | "ConnectionClosed"
+        | "ConnectionReset"
+        | "ConnectionRefused"
+        | "ConnectionAborted"
+        | "ConnectionFailed"
+        | "NameNotResolved"
+        | "InternetDisconnected"
+        | "AddressUnreachable"
+        | "BlockedByClient"
+        | "BlockedByResponse",
+    ): Promise<void>;
 
-    /** Fulfill a paused request by its interceptionId with a response. */
-    respondRequest(response: {
-      interceptionId: string;
-      status?: number;
-      headers?: Record<string, string>;
-      body?: string;
-      base64Encoded?: boolean;
-    }): Promise<void>;
+    /**
+     * Fulfill a paused request by its interceptionId with a response.
+     * @param opts.status - Response code. Defaults to 200 when omitted.
+     */
+    respondRequest(
+      interceptionId: string,
+      opts?: {
+        status?: number;
+        headers?: Record<string, string>;
+        body?: string;
+        contentType?: string;
+      },
+    ): Promise<void>;
 
     /** Register a callback invoked when a request is paused (interception). */
     onRequestPaused(callback: (event: any) => void): Promise<void>;
@@ -451,8 +518,8 @@ declare module "browser" {
     /** Set multiple cookies for the current page. */
     setCookies(cookies: Cookie[]): Promise<void>;
 
-    /** Delete a cookie by URL + name. */
-    deleteCookie(url: string, name: string): Promise<void>;
+    /** Delete a cookie by name. */
+    deleteCookie(name: string, url?: string): Promise<void>;
 
     /** Clear all browser cookies. */
     clearBrowserCookies(): Promise<void>;
@@ -515,8 +582,11 @@ declare module "browser" {
     /** Clear cache/storage for an origin. `storageTypes` defaults to `"all"`. */
     clearData(origin: string, storageTypes?: string): Promise<void>;
 
-    /** Resolve a frame's storage key (string) by its CDP frameId. */
-    getStorageKeyForFrame(frameId: string): Promise<string>;
+    /**
+     * Resolve a frame's storage key (string) by its CDP frameId. Resolves
+     * `null` when the frame has no storage key.
+     */
+    getStorageKeyForFrame(frameId: string): Promise<string | null>;
 
     // ---- Overlay (debug highlight) ----
     /** Highlight the first element matching the selector. */
@@ -580,7 +650,9 @@ declare module "browser" {
     path?: string;
     httpOnly?: boolean;
     secure?: boolean;
+    /** One of `"Strict"`, `"Lax"`, `"None"`; anything else throws a RangeError. */
     sameSite?: "Strict" | "Lax" | "None";
+    /** Unix timestamp in seconds. */
     expires?: number;
   }
 

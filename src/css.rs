@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — CSS domain methods (flat on `Page`).
 
@@ -8,7 +8,6 @@ use zuqe_zapi::*;
 use crate::{
     class_page::{get_page_client, get_page_session},
     dom,
-    helpers::promise_json,
 };
 
 /// `page.getComputedStyle(selector)`
@@ -19,7 +18,7 @@ pub(crate) fn js_page_get_computed_style<'a>(
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
-    promise_json(cx, async move {
+    cx.promise_fut_json(async move {
         let node_id = dom::resolve_selector(&client, &session_id, &selector).await?;
         let _ = client.send("CSS.enable", None, Some(&session_id)).await;
         let m = client
@@ -28,8 +27,7 @@ pub(crate) fn js_page_get_computed_style<'a>(
                 Some(serde_json::json!({ "nodeId": node_id })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         let entries = m
             .get("computedStyle")
             .and_then(|v| v.as_array())
@@ -55,7 +53,7 @@ pub(crate) fn js_page_get_matched_styles<'a>(
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let client = get_page_client(cx, cc.this())?;
     let session_id = get_page_session(cx, cc.this())?;
-    promise_json(cx, async move {
+    cx.promise_fut_json(async move {
         let node_id = dom::resolve_selector(&client, &session_id, &selector).await?;
         let _ = client.send("CSS.enable", None, Some(&session_id)).await;
         client
@@ -65,6 +63,5 @@ pub(crate) fn js_page_get_matched_styles<'a>(
                 Some(&session_id),
             )
             .await
-            .unwrap_or_else(|_| Err("channel closed".into()))
     })
 }

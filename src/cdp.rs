@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! CDP (Chrome DevTools Protocol) client over WebSocket.
 //!
 //! A background tokio task owns the WebSocket connection:
-//! JS threads submit commands via crossbeam channel, each command gets
+//! callers submit commands via an unbounded channel, each command gets
 //! a `tokio::sync::oneshot` response channel, and the background task
 //! dispatches responses by `id`.
+//!
+//! No command can stay pending forever: a dead socket, a torn-down command
+//! loop and an unanswered command each reject the caller's promise.
 
 use std::{
     collections::HashMap,
@@ -17,17 +20,25 @@ use std::{
     time::Duration,
 };
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
     net::TcpStream,
-    sync::{broadcast, oneshot},
+    sync::{broadcast, mpsc, oneshot},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWriter = futures_util::stream::SplitSink<WsStream, Message>;
 type WsReader = futures_util::stream::SplitStream<WsStream>;
+
+/// In-flight commands awaiting a response, keyed by command id. Shared with
+/// [`CdpClient`] so a timeout can drop its own entry.
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
+
+/// How long a command may stay unanswered before the caller's promise rejects.
+/// Chrome sometimes stops replying (renderer gone, a request held by Fetch
+/// interception); without a bound the JS promise would never settle.
+const CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A CDP event received from the browser (message with "method" but no "id").
 #[derive(Clone, Debug)]
@@ -37,7 +48,7 @@ pub(crate) struct CdpEvent {
     pub(crate) session_id: Option<String>,
 }
 
-/// A command submitted from JS to the background WebSocket task.
+/// A command submitted to the background WebSocket task.
 struct CdpCommand {
     msg: String,
     resp_tx: oneshot::Sender<Result<serde_json::Value, String>>,
@@ -46,9 +57,10 @@ struct CdpCommand {
 /// Thread-safe handle to the CDP connection.
 #[derive(Clone)]
 pub(crate) struct CdpClient {
-    cmd_tx: Sender<CdpCommand>,
+    cmd_tx: mpsc::UnboundedSender<CdpCommand>,
     next_id: Arc<AtomicU64>,
     event_tx: broadcast::Sender<CdpEvent>,
+    pending: Pending,
 }
 
 /// How long [`CdpClient::connect`] keeps retrying a *refused* WebSocket before
@@ -104,14 +116,16 @@ impl CdpClient {
         let (writer, reader) = ws_stream.split();
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
 
-        let (cmd_tx, cmd_rx) = unbounded::<CdpCommand>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<CdpCommand>();
         let next_id = Arc::new(AtomicU64::new(1));
         let (event_tx, _) = broadcast::channel::<CdpEvent>(256);
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
 
         let bg_writer = writer.clone();
         let bg_event_tx = event_tx.clone();
+        let bg_pending = pending.clone();
         let handle = tokio::spawn(async move {
-            Self::run_background(bg_writer, reader, cmd_rx, bg_event_tx).await;
+            Self::run_background(bg_writer, reader, cmd_rx, bg_event_tx, bg_pending).await;
         });
 
         Ok((
@@ -119,6 +133,7 @@ impl CdpClient {
                 cmd_tx,
                 next_id,
                 event_tx,
+                pending,
             },
             handle,
         ))
@@ -162,15 +177,16 @@ impl CdpClient {
     async fn run_background(
         writer: Arc<tokio::sync::Mutex<WsWriter>>,
         mut reader: WsReader,
-        cmd_rx: Receiver<CdpCommand>,
+        mut cmd_rx: mpsc::UnboundedReceiver<CdpCommand>,
         event_tx: broadcast::Sender<CdpEvent>,
+        pending: Pending,
     ) {
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
         let pending_r = pending.clone();
         let event_tx_r = event_tx.clone();
-        let reader_handle = tokio::spawn(async move {
+        // The reader is the only source of responses: once it stops, every
+        // in-flight command must fail rather than wait on a dead peer.
+        let (reader_done_tx, mut reader_done_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
             while let Some(msg) = reader.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
@@ -186,60 +202,65 @@ impl CdpClient {
                     _ => {}
                 }
             }
+            let _ = reader_done_tx.send(());
         });
 
         loop {
-            match cmd_rx.try_recv() {
-                Ok(cmd) => {
-                    Self::send_cmd(&writer, cmd, &pending).await;
-                }
-                Err(TryRecvError::Empty) => {
-                    if reader_handle.is_finished() {
-                        log::warn!("CDP reader task finished, shutting down");
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    log::debug!("CDP command channel closed, shutting down");
+            let cmd = tokio::select! {
+                cmd = cmd_rx.recv() => cmd,
+                _ = &mut reader_done_rx => {
+                    log::warn!("CDP reader task finished, shutting down");
                     break;
                 }
+            };
+            let Some(cmd) = cmd else {
+                log::debug!("CDP command channel closed, shutting down");
+                break;
+            };
+            if Self::send_cmd(&writer, cmd, &pending).await.is_err() {
+                break;
             }
+        }
+
+        // Nothing will answer the survivors now.
+        for (_, tx) in pending.lock().unwrap().drain() {
+            let _ = tx.send(Err("CDP connection closed".to_string()));
         }
     }
 
-    /// Send a single CDP command over WebSocket.
+    /// Write one command over the socket.
+    ///
+    /// Returns `Err` when the socket died: the caller tears the whole loop down,
+    /// because a half-open WebSocket would otherwise swallow every later
+    /// command without ever answering.
     async fn send_cmd(
         writer: &Arc<tokio::sync::Mutex<WsWriter>>,
         cmd: CdpCommand,
-        pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>,
-    ) {
-        let id: u64 = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cmd.msg) {
-            val.get("id").and_then(|v| v.as_u64()).unwrap_or(0)
-        } else {
-            0
-        };
+        pending: &Pending,
+    ) -> Result<(), String> {
+        let id = serde_json::from_str::<serde_json::Value>(&cmd.msg)
+            .ok()
+            .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
+            .unwrap_or(0);
 
-        if id > 0 {
-            pending.lock().unwrap().insert(id, cmd.resp_tx);
-        }
+        // Claim the id before writing so a response can never arrive unclaimed.
+        pending.lock().unwrap().insert(id, cmd.resp_tx);
 
         if let Err(e) = writer
             .lock()
             .await
-            .send(Message::Text(cmd.msg.clone().into()))
+            .send(Message::Text(cmd.msg.into()))
             .await
         {
-            log::error!("CDP WS send error: {e}");
+            pending.lock().unwrap().remove(&id);
+            return Err(format!("CDP WS send error: {e}"));
         }
+        Ok(())
     }
 
     /// Parse a received WS text message and dispatch to the matching pending command.
     /// Returns `true` if it was a command response (had "id"), `false` if it was not.
-    fn try_dispatch_response(
-        pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>,
-        text: &str,
-    ) -> bool {
+    fn try_dispatch_response(pending: &Pending, text: &str) -> bool {
         let Ok(val) = serde_json::from_str::<serde_json::Value>(text) else {
             return false;
         };
@@ -312,20 +333,56 @@ impl CdpClient {
         serde_json::to_string(&msg).unwrap()
     }
 
-    /// Send a CDP command and return a oneshot receiver for the response.
-    pub(crate) fn send(
+    /// Send a CDP command and await its response.
+    ///
+    /// Rejects instead of hanging when the peer dies, when the command loop is
+    /// gone, or when the command goes unanswered for [`CMD_TIMEOUT`].
+    pub(crate) async fn send(
         &self,
         method: &str,
         params: Option<serde_json::Value>,
         session_id: Option<&str>,
-    ) -> oneshot::Receiver<Result<serde_json::Value, String>> {
+    ) -> Result<serde_json::Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let msg = Self::build_msg(method, params, session_id, id);
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
 
-        let _ = self.cmd_tx.send(CdpCommand { msg, resp_tx: tx });
+        if self.cmd_tx.send(CdpCommand { msg, resp_tx: tx }).is_err() {
+            return Err("CDP command channel closed".to_string());
+        }
 
-        rx
+        match tokio::time::timeout(CMD_TIMEOUT, &mut rx).await {
+            Ok(res) => res.map_err(|_| "CDP connection closed".to_string())?,
+            Err(_) => {
+                // Drop the claim so a late response cannot resurrect the entry.
+                self.pending.lock().unwrap().remove(&id);
+                Err(format!(
+                    "CDP `{method}` timed out after {}s",
+                    CMD_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    }
+
+    /// Send a command without waiting for its response.
+    ///
+    /// For fire-and-forget commands whose answer the caller cannot act on (the
+    /// interception safety net resuming a request nobody claimed, a listener's
+    /// `accept()`). Spawns on the extension's runtime so the JS thread never
+    /// blocks; errors are dropped, which is the point.
+    pub(crate) fn send_detached(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        session_id: Option<&str>,
+    ) {
+        let this = self.clone();
+        let method = method.to_string();
+        let params = params.clone();
+        let session_id = session_id.map(|s| s.to_string());
+        crate::helpers::spawn(async move {
+            let _ = this.send(&method, params, session_id.as_deref()).await;
+        });
     }
 
     /// Subscribe to CDP events (messages without "id").
@@ -336,13 +393,12 @@ impl CdpClient {
 
     /// Close a target (tab).
     pub(crate) async fn close_target(&self, target_id: &str) -> Result<(), String> {
-        let rx = self.send(
+        self.send(
             "Target.closeTarget",
             Some(serde_json::json!({ "targetId": target_id })),
             None,
-        );
-        let resp = rx.await.map_err(|_| "channel closed".to_string())?;
-        resp?;
+        )
+        .await?;
         Ok(())
     }
 }

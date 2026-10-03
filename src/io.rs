@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — IO domain (flat on `Page`).
 
 use base64::Engine as _;
 use zuqe_zapi::*;
 
-use crate::{cdp::CdpClient, class_page::get_page_payload, helpers::promise_string};
+use crate::{cdp::CdpClient, class_page::get_page_payload};
 
 /// Read a CDP IO stream (`handle`) to completion and return its UTF-8 text.
 pub(crate) async fn read_io_stream(
@@ -24,7 +24,7 @@ pub(crate) async fn read_io_stream(
             Some(serde_json::json!({ "handle": handle, "offset": offset, "size": chunk })),
             Some(session_id),
         );
-        let resp = rx.await.unwrap_or_else(|_| Err("channel closed".into()))?;
+        let resp = rx.await?;
 
         let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
         let base64 = resp
@@ -62,7 +62,5 @@ pub(crate) fn js_page_read_stream<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    promise_string(cx, async move {
-        read_io_stream(&client, &session_id, &handle).await
-    })
+    cx.promise_fut_string(async move { read_io_stream(&client, &session_id, &handle).await })
 }

@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — DOM domain methods (flat on `Page`).
 
 use zuqe_zapi::*;
 
-use crate::{
-    cdp::CdpClient,
-    cdp_input,
-    class_page::get_page_payload,
-    helpers::{promise, promise_json, promise_string, promise_void},
-};
+use crate::{cdp::CdpClient, cdp_input, class_page::get_page_payload};
 
 /// Enable the DOM domain and resolve a CSS selector to a `nodeId`.
 pub(crate) async fn resolve_selector(
@@ -25,8 +20,7 @@ pub(crate) async fn resolve_selector(
             Some(serde_json::json!({ "depth": -1 })),
             Some(session_id),
         )
-        .await
-        .unwrap_or_else(|_| Err("channel closed".into()))?
+        .await?
         .get("root")
         .and_then(|r| r.get("nodeId"))
         .and_then(|v| v.as_i64())
@@ -37,8 +31,7 @@ pub(crate) async fn resolve_selector(
             Some(serde_json::json!({ "nodeId": doc, "selector": selector })),
             Some(session_id),
         )
-        .await
-        .unwrap_or_else(|_| Err("channel closed".into()))?
+        .await?
         .get("nodeId")
         .and_then(|v| v.as_i64())
         .ok_or_else(|| format!("selector not found: {selector}"))
@@ -57,9 +50,10 @@ pub(crate) fn js_page_query_selector<'a>(
 ) -> Result<ZqValue<'a>, ZqError> {
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise(cx, async move { resolve_selector(&client, &session_id, &selector).await }, |_cx, id| {
-        Ok(ZqValue::int32(id as i32))
-    })
+    cx.promise_fut_result(
+        async move { resolve_selector(&client, &session_id, &selector).await },
+        |_cx, id| Ok(ZqValue::int32(id as i32)),
+    )
 }
 
 /// `page.querySelectorAll(selector)` → array of nodeIds.
@@ -69,8 +63,7 @@ pub(crate) fn js_page_query_selector_all<'a>(
 ) -> Result<ZqValue<'a>, ZqError> {
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise(
-        cx,
+    cx.promise_fut_result(
         async move {
             let _ = client.send("DOM.enable", None, Some(&session_id)).await;
             let root = client
@@ -79,8 +72,7 @@ pub(crate) fn js_page_query_selector_all<'a>(
                     Some(serde_json::json!({ "depth": -1 })),
                     Some(&session_id),
                 )
-                .await
-                .unwrap_or_else(|_| Err("channel closed".into()))?
+                .await?
                 .get("root")
                 .and_then(|r| r.get("nodeId"))
                 .and_then(|v| v.as_i64())
@@ -91,8 +83,7 @@ pub(crate) fn js_page_query_selector_all<'a>(
                     Some(serde_json::json!({ "nodeId": root, "selector": selector })),
                     Some(&session_id),
                 )
-                .await
-                .unwrap_or_else(|_| Err("channel closed".into()))?;
+                .await?;
             Ok(q.get("nodeIds")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect::<Vec<_>>())
@@ -113,7 +104,7 @@ pub(crate) fn js_page_get_attribute<'a>(
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let name = cc.arg(1).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise_json(cx, async move {
+    cx.promise_fut_json(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
         let a = client
             .send(
@@ -121,8 +112,7 @@ pub(crate) fn js_page_get_attribute<'a>(
                 Some(serde_json::json!({ "nodeId": node_id })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         let attrs = a
             .get("attributes")
             .and_then(|v| v.as_array())
@@ -140,13 +130,10 @@ pub(crate) fn js_page_get_attribute<'a>(
 }
 
 /// `page.focus(selector)`
-pub(crate) fn js_page_focus<'a>(
-    cx: ZqCtx<'a>,
-    cc: ZqCallInfo<'a>,
-) -> Result<ZqValue<'a>, ZqError> {
+pub(crate) fn js_page_focus<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
         client
             .send(
@@ -154,8 +141,7 @@ pub(crate) fn js_page_focus<'a>(
                 Some(serde_json::json!({ "nodeId": node_id })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         Ok(())
     })
 }
@@ -167,7 +153,7 @@ pub(crate) fn js_page_get_box_model<'a>(
 ) -> Result<ZqValue<'a>, ZqError> {
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise_json(cx, async move {
+    cx.promise_fut_json(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
         let m = client
             .send(
@@ -175,8 +161,7 @@ pub(crate) fn js_page_get_box_model<'a>(
                 Some(serde_json::json!({ "nodeId": node_id })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         Ok(m.get("model").cloned().unwrap_or(serde_json::Value::Null))
     })
 }
@@ -188,7 +173,7 @@ pub(crate) fn js_page_remove<'a>(
 ) -> Result<ZqValue<'a>, ZqError> {
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
         client
             .send(
@@ -196,8 +181,7 @@ pub(crate) fn js_page_remove<'a>(
                 Some(serde_json::json!({ "nodeId": node_id })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         Ok(())
     })
 }
@@ -215,8 +199,7 @@ async fn content_center(
             Some(serde_json::json!({ "nodeId": node_id })),
             Some(session_id),
         )
-        .await
-        .unwrap_or_else(|_| Err("channel closed".into()))?;
+        .await?;
     quad_center(m.get("model"))
 }
 
@@ -233,8 +216,7 @@ async fn backend_center(
             Some(serde_json::json!({ "backendNodeId": backend_node_id })),
             Some(session_id),
         )
-        .await
-        .unwrap_or_else(|_| Err("channel closed".into()))?;
+        .await?;
     quad_center(m.get("model"))
 }
 
@@ -260,27 +242,21 @@ fn quad_center(model: Option<&serde_json::Value>) -> Result<(f64, f64), String> 
 }
 
 /// `page.click(selector)`
-pub(crate) fn js_page_click<'a>(
-    cx: ZqCtx<'a>,
-    cc: ZqCallInfo<'a>,
-) -> Result<ZqValue<'a>, ZqError> {
+pub(crate) fn js_page_click<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         let (cxp, cyp) = content_center(&client, &session_id, &selector).await?;
         cdp_input::mouse_click(&client, &session_id, cxp, cyp, "left", 1).await
     })
 }
 
 /// `page.type(selector, text)`
-pub(crate) fn js_page_type<'a>(
-    cx: ZqCtx<'a>,
-    cc: ZqCallInfo<'a>,
-) -> Result<ZqValue<'a>, ZqError> {
+pub(crate) fn js_page_type<'a>(cx: ZqCtx<'a>, cc: ZqCallInfo<'a>) -> Result<ZqValue<'a>, ZqError> {
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let text = cc.arg(1).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
         client
             .send(
@@ -288,16 +264,14 @@ pub(crate) fn js_page_type<'a>(
                 Some(serde_json::json!({ "nodeId": node_id })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         client
             .send(
                 "Input.insertText",
                 Some(serde_json::json!({ "text": text })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         Ok(())
     })
 }
@@ -364,14 +338,13 @@ pub(crate) fn js_page_aria_snapshot<'a>(
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
     let (client, session_id) = page(cx, cc.this())?;
-    promise_string(cx, async move {
+    cx.promise_fut_string(async move {
         let _ = client
             .send("Accessibility.enable", None, Some(&session_id))
             .await;
         let val = client
             .send("Accessibility.getFullAXTree", None, Some(&session_id))
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         Ok(build_aria_nodes(&val))
     })
 }
@@ -383,7 +356,7 @@ pub(crate) fn js_page_click_backend_node<'a>(
 ) -> Result<ZqValue<'a>, ZqError> {
     let backend_node_id = cc.arg_f64(cx, 0).map(|n| n as u64).unwrap_or(0);
     let (client, session_id) = page(cx, cc.this())?;
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         let (cxp, cyp) = backend_center(&client, &session_id, backend_node_id).await?;
         cdp_input::mouse_click(&client, &session_id, cxp, cyp, "left", 1).await
     })
@@ -397,7 +370,7 @@ pub(crate) fn js_page_type_backend_node<'a>(
     let backend_node_id = cc.arg_f64(cx, 0).map(|n| n as u64).unwrap_or(0);
     let text = cc.arg(1).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         let _ = client.send("DOM.enable", None, Some(&session_id)).await;
         client
             .send(
@@ -405,8 +378,7 @@ pub(crate) fn js_page_type_backend_node<'a>(
                 Some(serde_json::json!({ "backendNodeId": backend_node_id })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         cdp_input::insert_text(&client, &session_id, &text).await
     })
 }
@@ -418,7 +390,7 @@ pub(crate) fn js_page_get_node_value<'a>(
 ) -> Result<ZqValue<'a>, ZqError> {
     let selector = cc.arg(0).coerce_string(cx).unwrap_or_default();
     let (client, session_id) = page(cx, cc.this())?;
-    promise_string(cx, async move {
+    cx.promise_fut_string(async move {
         let node_id = resolve_selector(&client, &session_id, &selector).await?;
         let m = client
             .send(
@@ -426,8 +398,7 @@ pub(crate) fn js_page_get_node_value<'a>(
                 Some(serde_json::json!({ "nodeId": node_id })),
                 Some(&session_id),
             )
-            .await
-            .unwrap_or_else(|_| Err("channel closed".into()))?;
+            .await?;
         m.get("outerHTML")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())

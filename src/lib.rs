@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
 
-//! `browser` ?a zapi native extension exposing the CDP-driven `Browser` /
+//! `browser` — a zapi native extension exposing the CDP-driven `Browser` /
 //! `Page` API to aike. Import it from JS as `import { Browser } from "browser"`
 //! (with the compiled `browser.aike` on the module search path).
 
@@ -31,140 +31,111 @@ pub use {class_browser::JSBrowser, class_page::JSPage};
 
 use chrome::kill_all_spawned_browsers;
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use zuqe_zapi::{ZqCtx, ZqError, ZqGcTraceCtx, ZqRawValue};
+use zuqe_zapi::{
+    ZqCtx, ZqError, ZqGcTrace, ZqGcTraceCtx, ZqRawValue, ZqRuntime, ZqRuntimeState, ZqValue,
+};
 use zuqe_zapi_macros::zq_module;
 
 use cdp::CdpClient;
 
-/// Per-runtime browser-side state (JS callbacks), attached to the runtime via
-/// its [`ZqRuntime::id`](zuqe_zapi::ZqRuntime::id) so the engine traces it and
-/// two runtimes on one thread never share it.
+/// Per-runtime browser-side state (the JS callbacks this module holds outside
+/// the GC heap).
 #[derive(Default)]
 pub(crate) struct BrowserState {
     /// `handleCertificateError` callback (last wins).
-    pub(crate) cert_callback: Option<ZqRawValue>,
+    cert_callback: Option<ZqRawValue>,
     /// CDP client backing the generated `accept` closure.
-    pub(crate) cert_client: Option<CdpClient>,
-    /// eventId of the certificate error currently being delivered.
-    pub(crate) cert_event_id: Option<i64>,
+    cert_client: Option<CdpClient>,
     /// session id -> `onRequestPaused` callback (last wins).
-    pub(crate) fetch_callbacks: HashMap<String, ZqRawValue>,
+    fetch_callbacks: HashMap<String, ZqRawValue>,
+    /// `(session, requestId)` pairs the JS side already continued / aborted /
+    /// fulfilled, so the interception safety net does not resume them twice.
+    fetch_handled: HashSet<(String, String)>,
     /// session id -> `page.onLog` callback.
-    pub(crate) log_console_callbacks: HashMap<String, ZqRawValue>,
+    log_console_callbacks: HashMap<String, ZqRawValue>,
     /// session id -> `page.onConsole` callback.
-    pub(crate) runtime_console_callbacks: HashMap<String, ZqRawValue>,
+    runtime_console_callbacks: HashMap<String, ZqRawValue>,
 }
 
 impl BrowserState {
-    /// Mark every JS value held outside the GC heap so it survives collection.
+    /// Record that JS already resolved `requestId` on `session_id`, so the
+    /// interception safety net leaves it alone.
+    fn mark_fetch_handled(&mut self, session_id: &str, request_id: &str) {
+        self.fetch_handled
+            .insert((session_id.to_string(), request_id.to_string()));
+    }
+
+    /// Claim the safety net for a paused request: `true` when nothing has
+    /// handled it yet (so the caller must resume it).
+    fn claim_fetch(&mut self, session_id: &str, request_id: &str) -> bool {
+        !self
+            .fetch_handled
+            .remove(&(session_id.to_string(), request_id.to_string()))
+    }
+}
+
+impl ZqGcTrace for BrowserState {
+    /// Every JS value this module holds lives in one of the fields below.
     fn trace(&self, gcx: &mut ZqGcTraceCtx) {
-        let mark = |raw: ZqRawValue| {
-            let _ = gcx.mark(raw);
-        };
+        // `fetch_handled` holds only strings, so it is not marked.
+        for map in [
+            &self.fetch_callbacks,
+            &self.log_console_callbacks,
+            &self.runtime_console_callbacks,
+        ] {
+            for cb in map.values() {
+                let _ = gcx.mark(*cb);
+            }
+        }
         if let Some(cb) = self.cert_callback {
-            mark(cb);
-        }
-        for cb in self.fetch_callbacks.values() {
-            mark(*cb);
-        }
-        for cb in self.log_console_callbacks.values() {
-            mark(*cb);
-        }
-        for cb in self.runtime_console_callbacks.values() {
-            mark(*cb);
+            let _ = gcx.mark(cb);
         }
     }
 }
 
-// Per-runtime state, keyed by the opaque runtime identity handle. A module is
-// loaded once process-wide, so a thread_local is enough to keep two runtimes on
-// one thread apart.
-thread_local! {
-    static BROWSER_STATES: RefCell<HashMap<usize, BrowserState>> =
-        RefCell::new(HashMap::new());
-    /// Runtime identity handles currently registered via `gc_set_trace_func`.
-    static TRACE_RUNTIMES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+/// Keyed by runtime identity, GC-traced, dropped by the finalize hook — see
+/// [`ZqRuntimeState`].
+static STATE: ZqRuntimeState<BrowserState> = ZqRuntimeState::new();
+
+/// Run `f` against the calling runtime's [`BrowserState`].
+pub(crate) fn with_state<R>(cx: ZqCtx, f: impl FnOnce(&mut BrowserState) -> R) -> R {
+    STATE.with(cx, f)
 }
 
-/// `ctx.runtime().id()` for the runtime this context belongs to.
-fn runtime_key(ctx: ZqCtx) -> usize {
-    ctx.runtime().id()
-}
-
-/// Run `f` against the calling runtime's [`BrowserState`], creating it lazily,
-/// and make sure the per-runtime GC trace is installed before any callback can
-/// be stored.
-pub(crate) fn with_state<R>(ctx: ZqCtx, f: impl FnOnce(&mut BrowserState) -> R) -> R {
-    ensure_gc_trace(ctx);
-    let key = runtime_key(ctx);
-    BROWSER_STATES.with(|states| {
-        let mut states = states.borrow_mut();
-        f(states.entry(key).or_default())
-    })
-}
-
-/// GC trace trampoline registered once per runtime. Runs on the JS thread and
-/// reports every callback held in that runtime's [`BrowserState`].
-unsafe extern "C" fn trace_browser_state(
-    gcx: *mut zuqe_zapi::ffi::ZqGcTraceCtxS,
-    _opaque: *mut std::ffi::c_void,
-) {
-    let mut gcx = ZqGcTraceCtx::from(gcx);
-    // `try_with`: a GC trace must never fire during TLS teardown; ignore if it
-    // somehow does rather than aborting the process.
-    let _ = BROWSER_STATES.try_with(|states| {
-        for state in states.borrow().values() {
-            state.trace(&mut gcx);
-        }
-    });
-}
-
-/// Install the per-runtime GC trace once, before any callback is stored.
-fn ensure_gc_trace(ctx: ZqCtx) {
-    let key = runtime_key(ctx);
-    let already = TRACE_RUNTIMES.with(|rts| {
-        let mut rts = rts.borrow_mut();
-        if rts.contains(&key) {
-            true
-        } else {
-            rts.push(key);
-            false
-        }
-    });
-    if !already {
-        let _ = ctx.gc_set_trace_func(Some(trace_browser_state), std::ptr::null_mut());
-    }
-}
-
-/// Runtime-finalize hook: kill any browser processes this module spawned and
-/// drop this runtime's state. Must not call any JS API.
+/// Validate an event-callback argument and hand back the raw handle the traced
+/// state map stores.
 ///
-/// Runs at runtime teardown, when thread-local destructors may already have run;
-/// `try_with` keeps a torn-down TLS from aborting the process.
-unsafe extern "C" fn finalize_runtime(rt: *mut zuqe_zapi::ffi::ZqRuntime) {
-    let key = rt as usize;
-    let _ = BROWSER_STATES.try_with(|states| {
-        let empty = {
-            let mut guard = states.borrow_mut();
-            guard.remove(&key);
-            guard.is_empty()
-        };
-        if empty {
-            kill_all_spawned_browsers();
-        }
-    });
-    let _ = TRACE_RUNTIMES.try_with(|rts| {
-        rts.borrow_mut().retain(|k| *k != key);
-    });
+/// Storing a non-function would fail *silently*: the listener job would find it,
+/// find it uncallable, and drop every event with no diagnostic at all.
+pub(crate) fn require_callback(cx: ZqCtx, v: ZqValue) -> Result<ZqRawValue, ZqError> {
+    if !v.is_callable() {
+        return Err(cx.throw_type("callback argument must be a function"));
+    }
+    Ok(v.raw())
+}
+
+/// Runtime-finalize hook: drop this runtime's callbacks and, once no runtime is
+/// left, kill any browser processes this module spawned. Must not call any JS
+/// API.
+///
+/// Runs at runtime teardown, when thread-local destructors may already have run.
+unsafe extern "C" fn finalize_runtime(rt: *mut ZqRuntime) {
+    STATE.finalize(rt);
+    // Spawned browsers are process-wide and may still serve another runtime, so
+    // reap them only when the last one is gone.
+    if STATE.is_empty() {
+        kill_all_spawned_browsers();
+    }
 }
 
 /// Module init: register the non-exported `BrowserProcess` class (like the
 /// built-in module's `use_classes`), so `Browser.spawn()` can instantiate it.
-/// Per-runtime GC state is installed lazily from the first browser call.
+/// The async executor and per-runtime state are named here, before any body
+/// runs.
 #[zq_module(name = "browser", exports = [JSBrowser, JSPage], finalize = finalize_runtime)]
 fn module_init(cx: &ZqCtx) -> Result<(), ZqError> {
+    cx.set_default_executor(helpers::executor);
     class_browser::JSBrowserProcess::register(*cx)
 }

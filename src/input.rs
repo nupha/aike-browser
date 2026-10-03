@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright (c) 2025-2026 John Ray <996351336@qq.com>
+// SPDX-FileCopyrightText: Copyright (c) 2026 John Ray <996351336@qq.com>
 
 //! Page class — Input domain methods.
 //!
@@ -13,7 +13,6 @@ use crate::{
     cdp_input,
     class_page::{get_number_prop, get_page_payload, get_str_prop, send_page_void_cmd},
     dom::resolve_selector,
-    helpers::promise_void,
 };
 
 /// Resolve a selector to its on-screen center via `DOM.getBoxModel`.
@@ -29,8 +28,7 @@ async fn box_center(
             Some(serde_json::json!({ "nodeId": node_id })),
             Some(session_id),
         )
-        .await
-        .unwrap_or_else(|_| Err("channel closed".into()))?;
+        .await?;
     let quad = m
         .get("model")
         .and_then(|mo| mo.get("content"))
@@ -80,7 +78,7 @@ pub(crate) fn js_page_mouse_click<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         cdp_input::mouse_click(&client, &session_id, x, y, &button, click_count).await
     })
 }
@@ -95,9 +93,7 @@ pub(crate) fn js_page_mouse_move<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    promise_void(cx, async move {
-        cdp_input::mouse_move(&client, &session_id, x, y).await
-    })
+    cx.promise_fut_void(async move { cdp_input::mouse_move(&client, &session_id, x, y).await })
 }
 
 /// `page.mouseDown(x, y, options?)`
@@ -111,7 +107,7 @@ pub(crate) fn js_page_mouse_down<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         cdp_input::mouse_down(&client, &session_id, x, y, &button, click_count).await
     })
 }
@@ -127,7 +123,7 @@ pub(crate) fn js_page_mouse_up<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         cdp_input::mouse_up(&client, &session_id, x, y, &button, click_count).await
     })
 }
@@ -145,15 +141,15 @@ pub(crate) fn js_page_key_press<'a>(
     {
         modifiers = m as i32;
     }
-    let code = key.chars().next().map(|c| c as i32).unwrap_or(0);
+    // Reject an unusable key here rather than letting Chrome answer with
+    // `Invalid 'text' parameter` or typing the wrong character.
+    cdp_input::resolve_key(&key).map_err(|e| cx.throw_type(&e))?;
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    promise_void(cx, async move {
-        cdp_input::dispatch_key_event(&client, &session_id, "keyDown", &key, code, modifiers).await?;
-        cdp_input::dispatch_key_event(&client, &session_id, "char", &key, code, modifiers).await?;
-        cdp_input::dispatch_key_event(&client, &session_id, "keyUp", &key, code, modifiers).await
-    })
+    cx.promise_fut_void(
+        async move { cdp_input::press_key(&client, &session_id, &key, modifiers).await },
+    )
 }
 
 /// `page.dragAndDrop(sourceSelector, targetSelector)`
@@ -166,7 +162,7 @@ pub(crate) fn js_page_drag_and_drop<'a>(
     let payload = get_page_payload(cx, cc.this())?;
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
-    promise_void(cx, async move {
+    cx.promise_fut_void(async move {
         let (sx, sy) = box_center(&client, &session_id, &source).await?;
         let (tx, ty) = box_center(&client, &session_id, &target).await?;
         cdp_input::mouse_move(&client, &session_id, sx, sy).await?;
@@ -183,5 +179,10 @@ pub(crate) fn js_page_insert_text<'a>(
     cc: ZqCallInfo<'a>,
 ) -> Result<ZqValue<'a>, ZqError> {
     let text = cc.arg(0).coerce_string(cx).unwrap_or_default();
-    send_page_void_cmd(cx, &cc, "Input.insertText", Some(serde_json::json!({ "text": text })))
+    send_page_void_cmd(
+        cx,
+        &cc,
+        "Input.insertText",
+        Some(serde_json::json!({ "text": text })),
+    )
 }
