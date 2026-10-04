@@ -37,7 +37,12 @@ for (let i = 1; i <= cycles; i++) {
     browser = await Browser.launch({ headless: true });
     const page = await browser.newPage();
     await page.navigate("data:text/html,<h1>race</h1>");
-    const title = await page.evaluate("document.querySelector('h1').textContent");
+    // `navigate` resolves on the CDP reply, before the parser commits the new
+    // document, so an immediate `evaluate` could still see the old about:blank.
+    await page.waitForSelector("h1", 5000);
+    const title = await page.evaluate(
+      "document.querySelector('h1').textContent",
+    );
     if (title !== "race") throw new Error("page did not load: " + title);
     await page.close();
     await browser.close();
@@ -47,7 +52,10 @@ for (let i = 1; i <= cycles; i++) {
       if (browser) await browser.close();
     } catch (_) {}
   }
-  if (i % 5 === 0) console.log("  ... " + i + "/" + cycles + " cycles, errors so far: " + errors.length);
+  if (i % 5 === 0)
+    console.log(
+      "  ... " + i + "/" + cycles + " cycles, errors so far: " + errors.length,
+    );
 }
 
 check(
@@ -55,7 +63,11 @@ check(
   errors.length === 0,
   errors.slice(0, 5).join(" | "),
 );
-check("no launch errors recorded", errors.length === 0, "count=" + errors.length);
+check(
+  "no launch errors recorded",
+  errors.length === 0,
+  "count=" + errors.length,
+);
 
 console.log("\n" + "=".repeat(50));
 console.log("pass: " + pass + ", fail: " + fail);

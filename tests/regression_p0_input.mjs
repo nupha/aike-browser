@@ -48,14 +48,17 @@ async function poll(page, fn, tries = 80) {
   return v;
 }
 
-// `file:///C:/dir/file.mjs` -> `C:\dir\file.mjs`
+// `file:///dir/file.mjs` -> `/dir/file.mjs`, `file:///C:/dir/f.mjs` -> `C:/dir/f.mjs`.
+// The separators stay `/` on every platform: forcing `\` here handed Chrome a
+// path that does not exist on unix, and a missing file is accepted silently as
+// a 0-byte File named after the whole path -- exactly the B-018 symptom.
 function fileURLToPath(url) {
   let p = String(url);
   const scheme = "file://";
   if (p.indexOf(scheme) === 0) p = p.slice(scheme.length);
   // Strip the (empty on unix, a drive name on Windows) authority component.
   if (p.charAt(0) === "/" && /^\/[A-Za-z]:/.test(p)) p = p.slice(1);
-  return decodeURIComponent(p).replace(/\//g, "\\");
+  return decodeURIComponent(p);
 }
 
 const INPUT_PAGE =
@@ -163,7 +166,7 @@ async function testUploadFile(browser) {
   await page.waitForSelector("#f", 5000);
 
   const path = fileURLToPath(import.meta.url);
-  const base = path.replace(/\\/g, "/").split("/").pop();
+  const base = path.split("/").pop();
 
   let error = null;
   try {
