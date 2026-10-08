@@ -95,8 +95,7 @@ pub(crate) fn js_page_query_selector_all<'a>(
                 .unwrap_or_default())
         },
         |cx, ids: Vec<i64>| {
-            let vals: Vec<ZqValue> = ids.iter().map(|i| ZqValue::int32(*i as i32)).collect();
-            ZqValue::new_array(cx, &vals)
+            ZqValue::array_from_iter(cx, ids.iter().map(|i| ZqValue::int32(*i as i32)))
         },
     )
 }
@@ -192,7 +191,11 @@ pub(crate) fn js_page_remove<'a>(
 }
 
 /// Center of a node's content box via `DOM.getBoxModel` (by `nodeId`).
-async fn content_center(
+///
+/// The single spelling of "point to aim an input event at": `page.click` and
+/// `page.dragAndDrop` must land on the same pixel, so a second averaging variant
+/// living next to this one was a latent disagreement rather than a shortcut.
+pub(crate) async fn content_center(
     client: &CdpClient,
     session_id: &str,
     selector: &str,

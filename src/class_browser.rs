@@ -33,7 +33,7 @@ const WINDOW_STATES: &[&str] = &["normal", "minimized", "maximized", "fullscreen
 /// Payload attached to every `Browser` instance.
 pub(crate) struct BrowserPayload {
     pub(crate) client: cdp::CdpClient,
-    pub(crate) chrome_child: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
+    pub(crate) chrome_child: chrome::ChildSlot,
     /// Auto-created Chrome profile dir, removed once the child is reaped.
     pub(crate) user_data_dir: Option<std::path::PathBuf>,
     /// Cleared by `close()`. Attach mode owns no process, so this is what
@@ -148,7 +148,7 @@ impl JSBrowser {
                 // `Child::id()` is only available while the child is unwaited,
                 // and the slot is contended during any kill; capture it now.
                 let pid = s.child.id().unwrap_or(0);
-                let handle: ChildArcSlot = Arc::new(tokio::sync::Mutex::new(Some(s.child)));
+                let handle: chrome::ChildSlot = Arc::new(tokio::sync::Mutex::new(Some(s.child)));
                 chrome::register_spawned_child(&handle);
                 Ok((s.bin, s.cdp_url, handle, s.user_data_dir, pid))
             },
@@ -235,7 +235,7 @@ impl JSBrowser {
                 // `targetId` own property (readonly in the d.ts; kept writable
                 // here so the native install always wins).
                 let id_val = ZqValue::new_string(cx, &target_id)?;
-                page.define_str(
+                page.define_property_str(
                     cx,
                     "targetId",
                     id_val,
@@ -547,12 +547,10 @@ fn browser_promise<'a>(cx: ZqCtx<'a>, req: LaunchRequest) -> Result<ZqValue<'a>,
 // BrowserProcess handle (Browser.spawn)
 // ---------------------------------------------------------------------------
 
-type ChildArcSlot = Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>;
-
 pub(crate) struct BrowserProcessPayload {
     /// Shared with the spawn registry so runtime-exit cleanup can kill the
     /// process even if this handle was GC-collected.
-    pub(crate) child: ChildArcSlot,
+    pub(crate) child: chrome::ChildSlot,
     /// Resolved browser binary path (surfaced via the `bin` getter).
     pub(crate) bin: String,
     /// Ready browser-level CDP WebSocket URL (surfaced via `cdpUrl`).

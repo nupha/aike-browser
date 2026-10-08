@@ -52,16 +52,16 @@ fn cookie_to_js<'a>(cx: ZqCtx<'a>, c: &serde_json::Value) -> Result<ZqValue<'a>,
     let obj = ZqValue::new_object(cx)?;
     for key in ["name", "value", "domain", "path"] {
         if let Some(s) = c.get(key).and_then(|v| v.as_str()) {
-            obj.set_str(cx, key, ZqValue::new_string(cx, s)?)?;
+            obj.set_property_str(cx, key, ZqValue::new_string(cx, s)?)?;
         }
     }
     for key in ["httpOnly", "secure", "session"] {
         if let Some(b) = c.get(key).and_then(|v| v.as_bool()) {
-            obj.set_str(cx, key, ZqValue::bool(b))?;
+            obj.set_property_str(cx, key, ZqValue::bool(b))?;
         }
     }
     if let Some(s) = c.get("sameSite").and_then(|v| v.as_str()) {
-        obj.set_str(cx, "sameSite", ZqValue::new_string(cx, s)?)?;
+        obj.set_property_str(cx, "sameSite", ZqValue::new_string(cx, s)?)?;
     }
     for key in ["expires", "priority", "size", "sourcePort", "sourceScheme"] {
         // `Network.Cookie.expires` is `-1` for a session cookie; surfacing that
@@ -70,7 +70,7 @@ fn cookie_to_js<'a>(cx: ZqCtx<'a>, c: &serde_json::Value) -> Result<ZqValue<'a>,
             continue;
         }
         if let Some(n) = c.get(key).and_then(|v| v.as_f64()) {
-            obj.set_str(cx, key, ZqValue::from_json(cx, &serde_json::json!(n))?)?;
+            obj.set_property_str(cx, key, ZqValue::number(n))?;
         }
     }
     Ok(obj)
@@ -98,13 +98,9 @@ pub(crate) fn js_page_get_cookies<'a>(
                 .unwrap_or_default())
         },
         |cx, cookies: Vec<serde_json::Value>| {
-            let mut js_cookies: Vec<ZqValue> = Vec::with_capacity(cookies.len());
-            for c in &cookies {
-                if let Ok(obj) = cookie_to_js(cx, c) {
-                    js_cookies.push(obj);
-                }
-            }
-            ZqValue::new_array(cx, &js_cookies)
+            // A cookie that cannot be built is skipped rather than failing the
+            // whole listing.
+            ZqValue::array_from_iter(cx, cookies.iter().filter_map(|c| cookie_to_js(cx, c).ok()))
         },
     )
 }

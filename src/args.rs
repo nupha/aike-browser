@@ -122,7 +122,7 @@ macro_rules! prop_reader {
         /// Optional property: `undefined` means "not provided"; a present value
         /// of the wrong type throws.
         pub(crate) fn $name(cx: ZqCtx, obj: &ZqValue, key: &str) -> Result<Option<$ty>, ZqError> {
-            let v = obj.get_str(cx, key)?;
+            let v = obj.get_property_str(cx, key)?;
             if v.is_undefined() {
                 Ok(None)
             } else {
@@ -143,7 +143,7 @@ pub(crate) fn opt_object_prop<'a>(
     obj: &ZqValue<'a>,
     key: &str,
 ) -> Result<Option<ZqValue<'a>>, ZqError> {
-    let v = obj.get_str(cx, key)?;
+    let v = obj.get_property_str(cx, key)?;
     if v.is_undefined() {
         Ok(None)
     } else if v.as_object().is_some() {
@@ -170,7 +170,7 @@ pub(crate) fn string_map(
     let mut map = serde_json::Map::new();
     for i in 0..len {
         let key = names.get_index(cx, i as u32)?.string_read_utf8(cx)?;
-        let value = obj.get_str(cx, &key)?;
+        let value = obj.get_property_str(cx, &key)?;
         let s = to_string(cx, value, &format!("{name}.{key}"))?;
         map.insert(key, serde_json::Value::String(s));
     }
@@ -183,7 +183,7 @@ pub(crate) fn opt_array_prop<'a>(
     obj: &ZqValue<'a>,
     key: &str,
 ) -> Result<Option<ZqValue<'a>>, ZqError> {
-    let v = obj.get_str(cx, key)?;
+    let v = obj.get_property_str(cx, key)?;
     if v.is_undefined() {
         Ok(None)
     } else if v.is_array(cx)? {

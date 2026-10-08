@@ -69,23 +69,20 @@ pub(crate) fn js_page_set_request_interception<'a>(
         // the event — that request then stays paused and its page never loads.
         let event_rx = client.subscribe_events();
         let resume_client = client.clone();
-        let tx = cx.spawn_event_job("fetch", move |cx, msg: serde_json::Value| {
-            let sess = msg
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let params = msg
-                .get("params")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+        // The channel carries the event params directly: the forwarding task
+        // below already filters on this page's session, so wrapping the pair in
+        // a `{sessionId, params}` object only to re-parse it here was pure
+        // overhead. The callback is still looked up per delivery (rather than
+        // captured) so a re-registered listener takes effect and the GC keeps it
+        // alive.
+        let cb_session = session_id.clone();
+        let tx = cx.spawn_event_job("fetch", move |cx, params: serde_json::Value| {
             let request_id = params
                 .get("requestId")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            let cb = sess
-                .as_ref()
-                .and_then(|s| with_state(cx, |st| st.fetch_callbacks.get(s).copied()));
+            let cb = with_state(cx, |st| st.fetch_callbacks.get(&cb_session).copied());
 
             if let (Some(cb), Some(_)) = (cb, request_id.clone())
                 && let Ok(obj) = ZqValue::from_json(cx, &params)
@@ -95,10 +92,10 @@ pub(crate) fn js_page_set_request_interception<'a>(
             // A paused request stays paused until somebody continues, aborts or
             // fulfills it — a missing callback (or one that threw, or one that
             // ignored the event) would hang the page forever.
-            if let (Some(sess), Some(request_id)) = (sess, request_id)
-                && with_state(cx, |st| st.claim_fetch(&sess, &request_id))
+            if let Some(request_id) = request_id
+                && with_state(cx, |st| st.claim_fetch(&cb_session, &request_id))
             {
-                resume(&resume_client, &sess, &request_id);
+                resume(&resume_client, &cb_session, &request_id);
             }
         });
 
@@ -118,11 +115,7 @@ pub(crate) fn js_page_set_request_interception<'a>(
                         if evt.method == "Fetch.requestPaused"
                             && evt.session_id.as_deref() == Some(&session_ev) =>
                     {
-                        let msg = serde_json::json!({
-                            "sessionId": evt.session_id,
-                            "params": evt.params,
-                        });
-                        if tx.send(msg).is_err() {
+                        if tx.send(evt.params).is_err() {
                             break;
                         }
                     }

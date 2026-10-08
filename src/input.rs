@@ -9,50 +9,13 @@
 use zuqe_zapi::*;
 
 use crate::{
-    args,
-    cdp::CdpClient,
-    cdp_input,
+    args, cdp_input,
     class_page::{get_enum_prop, get_i64_prop, get_page_payload, send_page_void_cmd},
-    dom::resolve_selector,
+    dom,
 };
 
 /// `Input.dispatchMouseEvent.button` values.
 const BUTTONS: &[&str] = &["left", "middle", "right"];
-
-/// Resolve a selector to its on-screen center via `DOM.getBoxModel`.
-async fn box_center(
-    client: &CdpClient,
-    session_id: &str,
-    selector: &str,
-) -> Result<(f64, f64), String> {
-    let node_id = resolve_selector(client, session_id, selector).await?;
-    let m = client
-        .send(
-            "DOM.getBoxModel",
-            Some(serde_json::json!({ "nodeId": node_id })),
-            Some(session_id),
-        )
-        .await?;
-    let quad = m
-        .get("model")
-        .and_then(|mo| mo.get("content"))
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "no box model content".to_string())?;
-    let xs: Vec<f64> = quad.iter().step_by(2).filter_map(|v| v.as_f64()).collect();
-    let ys: Vec<f64> = quad
-        .iter()
-        .skip(1)
-        .step_by(2)
-        .filter_map(|v| v.as_f64())
-        .collect();
-    if xs.is_empty() || ys.is_empty() {
-        return Err("empty box model".into());
-    }
-    Ok((
-        xs.iter().sum::<f64>() / xs.len() as f64,
-        ys.iter().sum::<f64>() / ys.len() as f64,
-    ))
-}
 
 /// Parse `options = { button?, clickCount? }`.
 fn click_options<'a>(cx: ZqCtx<'a>, cc: &ZqCallInfo<'a>) -> Result<(String, i32), ZqError> {
@@ -175,8 +138,8 @@ pub(crate) fn js_page_drag_and_drop<'a>(
     let client = payload.client.clone();
     let session_id = payload.session_id.clone();
     cx.promise_fut_void(async move {
-        let (sx, sy) = box_center(&client, &session_id, &source).await?;
-        let (tx, ty) = box_center(&client, &session_id, &target).await?;
+        let (sx, sy) = dom::content_center(&client, &session_id, &source).await?;
+        let (tx, ty) = dom::content_center(&client, &session_id, &target).await?;
         cdp_input::mouse_move(&client, &session_id, sx, sy).await?;
         cdp_input::mouse_down(&client, &session_id, sx, sy, "left", 1).await?;
         cdp_input::mouse_move_dragging(&client, &session_id, tx, ty, LEFT_BUTTON_MASK).await?;

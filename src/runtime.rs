@@ -185,19 +185,17 @@ pub(crate) fn js_page_on_console<'a>(
     let event_rx = client.subscribe_events();
     let _ = crate::class_page::send_page_void_cmd(cx, &cc, "Runtime.enable", None);
 
-    let tx = cx.spawn_event_job("console", move |cx, msg: serde_json::Value| {
-        let sess = msg
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let params = msg
-            .get("params")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let cb = sess
-            .as_ref()
-            .and_then(|s| with_state(cx, |st| st.runtime_console_callbacks.get(s).copied()));
-        if let (Some(cb), Some(_sess)) = (cb, sess)
+    // The channel carries the event params directly: the forwarding task below
+    // already filters on this page's session, so wrapping the pair in a
+    // `{sessionId, params}` object only to re-parse it here was pure overhead.
+    // The callback is still looked up per delivery (rather than captured) so a
+    // re-registered listener takes effect and the GC keeps it alive.
+    let cb_session = session_id.clone();
+    let tx = cx.spawn_event_job("console", move |cx, params: serde_json::Value| {
+        let cb = with_state(cx, |st| {
+            st.runtime_console_callbacks.get(&cb_session).copied()
+        });
+        if let Some(cb) = cb
             && let Ok(obj) = ZqValue::from_json(cx, &params)
         {
             cx.call_event_handler(cb, ZqValue::undefined(), &[obj], "console");
@@ -215,11 +213,7 @@ pub(crate) fn js_page_on_console<'a>(
                     if evt.method == "Runtime.consoleAPICalled"
                         && evt.session_id.as_deref() == Some(&session_ev) =>
                 {
-                    let msg = serde_json::json!({
-                        "sessionId": evt.session_id,
-                        "params": evt.params,
-                    });
-                    if tx.send(msg).is_err() {
+                    if tx.send(evt.params).is_err() {
                         break;
                     }
                 }

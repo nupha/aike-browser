@@ -16,11 +16,17 @@ use tokio::{process::Child, time::sleep};
 /// Per-launch sequence number, makes auto-port user-data-dirs unique.
 static LAUNCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// A shared slot holding an optional live child process.
+///
+/// `Arc` because the spawn registry and the JS-visible `Browser` /
+/// `BrowserProcess` payloads all name the same process; the `Option` is what
+/// distinguishes "we still own this child" from "already reaped".
+pub(crate) type ChildSlot = Arc<tokio::sync::Mutex<Option<Child>>>;
+
 /// Child handles of live `Browser.spawn()` processes, killed at runtime exit.
 /// Dropping / GC-collecting the JS handle does NOT kill the process ?that is
 /// the whole point of the explicit-ownership model (`kill()` or exit cleanup).
-static SPAWNED_BROWSERS: OnceLock<Mutex<Vec<Arc<tokio::sync::Mutex<Option<Child>>>>>> =
-    OnceLock::new();
+static SPAWNED_BROWSERS: OnceLock<Mutex<Vec<ChildSlot>>> = OnceLock::new();
 
 /// Kill every registered `Browser.spawn()` child. Called from the engine's
 /// atexit / signal-handler cleanup alongside `spawn::kill_all_children`.
@@ -47,7 +53,7 @@ pub(crate) fn kill_all_spawned_browsers() {
     }
 }
 
-pub(crate) fn register_spawned_child(handle: &Arc<tokio::sync::Mutex<Option<Child>>>) {
+pub(crate) fn register_spawned_child(handle: &ChildSlot) {
     let reg = SPAWNED_BROWSERS.get_or_init(|| Mutex::new(Vec::new()));
     let mut guard = reg.lock().unwrap();
     // The registry tracks *live* processes: entries whose child is already gone

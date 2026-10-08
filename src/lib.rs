@@ -30,10 +30,7 @@ mod tracing;
 
 pub use {class_browser::JSBrowser, class_page::JSPage};
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::atomic::{AtomicU32, Ordering},
-};
+use std::collections::{HashMap, HashSet};
 
 use zuqe_zapi::{
     ZqCtx, ZqError, ZqGcTrace, ZqGcTraceCtx, ZqRawValue, ZqRuntime, ZqRuntimeState, ZqValue,
@@ -56,7 +53,7 @@ pub(crate) enum Listener {
     Console,
     /// `page.setRequestInterception` / `onRequestPaused` (scoped by session id).
     Fetch,
-    /// `browser.handleCertificateError` (scoped by its `accept` magic).
+    /// `browser.handleCertificateError` (scoped by CDP connection id).
     Cert,
 }
 
@@ -72,24 +69,17 @@ pub(crate) struct CertListener {
     pub(crate) client: CdpClient,
 }
 
-/// Next `accept` trampoline magic. Dense, so it always fits the `i32` the
-/// `#[zq_function]` body reads back through `cc.magic()`.
-static CERT_MAGIC: AtomicU32 = AtomicU32::new(1);
-
-pub(crate) fn next_cert_magic() -> i32 {
-    CERT_MAGIC.fetch_add(1, Ordering::Relaxed) as i32
-}
-
 /// Per-runtime browser-side state (the JS callbacks this module holds outside
 /// the GC heap).
 #[derive(Default)]
 pub(crate) struct BrowserState {
-    /// `handleCertificateError` listeners, keyed by their `accept` magic.
+    /// `handleCertificateError` listeners, keyed by their connection id.
     ///
     /// One slot per runtime let two browsers deliver each other's certificate
-    /// errors, and re-registering left the first forwarding task running so
-    /// both callbacks fired for every event.
-    cert_listeners: HashMap<i32, CertListener>,
+    /// errors, and keying by a per-registration counter instead let every
+    /// re-registration leave the previous callback — and its forwarding task —
+    /// running, so both fired for every event.
+    cert_listeners: HashMap<u32, CertListener>,
     /// session id -> `onRequestPaused` callback (last wins).
     fetch_callbacks: HashMap<String, ZqRawValue>,
     /// `(session, requestId)` pairs the JS side already continued / aborted /
@@ -125,27 +115,26 @@ impl BrowserState {
     }
 
     /// Register (or replace) this browser's certificate-error listener.
-    pub(crate) fn set_cert_listener(
-        &mut self,
-        magic: i32,
-        callback: ZqRawValue,
-        client: CdpClient,
-    ) {
+    pub(crate) fn set_cert_listener(&mut self, id: u32, callback: ZqRawValue, client: CdpClient) {
         self.cert_listeners
-            .insert(magic, CertListener { callback, client });
+            .insert(id, CertListener { callback, client });
     }
 
     /// The connection an `accept` call belongs to.
     pub(crate) fn cert_client(&self, magic: i32) -> Option<CdpClient> {
-        self.cert_listeners.get(&magic).map(|l| l.client.clone())
+        // The trampoline magic *is* the connection id (see `NEXT_CLIENT_ID`), so
+        // widening it back is exact rather than a guess.
+        self.cert_listeners
+            .get(&(magic as u32))
+            .map(|l| l.client.clone())
     }
 
     /// Install a listener's forwarding task, aborting whatever it replaces.
     ///
-    /// `scope` is the session id for page-level listeners and the magic rendered
-    /// as a string for the browser-level certificate listener. The superseded
-    /// `ZqWakeSender` is dropped with the old task, which disconnects the old
-    /// event job.
+    /// `scope` is the session id for page-level listeners and the connection id
+    /// rendered as a string for the browser-level certificate listener. The
+    /// superseded `ZqWakeSender` is dropped with the old task, which disconnects
+    /// the old event job.
     pub(crate) fn set_listener_task(
         &mut self,
         listener: Listener,

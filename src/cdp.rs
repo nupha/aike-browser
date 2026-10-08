@@ -15,7 +15,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -64,6 +64,10 @@ struct CdpCommand {
 /// Thread-safe handle to the CDP connection.
 #[derive(Clone)]
 pub(crate) struct CdpClient {
+    /// Stable per-connection identity, so extension state can key on "this
+    /// connection" and stay stable across re-registrations — unlike a counter
+    /// minted per registration, which would orphan the previous entry.
+    id: u32,
     cmd_tx: mpsc::UnboundedSender<CdpCommand>,
     next_id: Arc<AtomicU64>,
     event_tx: broadcast::Sender<CdpEvent>,
@@ -71,6 +75,10 @@ pub(crate) struct CdpClient {
     /// Flipped by [`Self::disconnect`] to tear the background loop down.
     shutdown: tokio::sync::watch::Sender<bool>,
 }
+
+/// Dense from 1, so an id always fits the `i32` a `#[zq_function]` trampoline
+/// reads back through `cc.magic()`.
+static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
 
 /// How long [`CdpClient::connect`] keeps retrying a *refused* WebSocket before
 /// giving up. The endpoint probe (`DevToolsActivePort` / `/json/version`) can
@@ -152,6 +160,7 @@ impl CdpClient {
 
         Ok((
             Self {
+                id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
                 cmd_tx,
                 next_id,
                 event_tx,
@@ -160,6 +169,12 @@ impl CdpClient {
             },
             handle,
         ))
+    }
+
+    /// This connection's identity: stable for the connection's lifetime and
+    /// distinct from every other live connection.
+    pub(crate) fn id(&self) -> u32 {
+        self.id
     }
 
     /// Resolve a bare-origin CDP URL (e.g. "ws://127.0.0.1:9222") to the full
@@ -513,7 +528,6 @@ impl CdpClient {
     ) {
         let this = self.clone();
         let method = method.to_string();
-        let params = params.clone();
         let session_id = session_id.map(|s| s.to_string());
         crate::helpers::spawn(async move {
             let _ = this.send(&method, params, session_id.as_deref()).await;
@@ -569,6 +583,11 @@ impl CdpClient {
 /// The shared tokio runtime backing all CDP async work. A zapi extension has
 /// no access to the host's executor, so it owns one lazily-started multi-thread
 /// runtime. Every `tokio::spawn` in the module runs on this.
+///
+/// Multi-thread is required, not a default: nothing here ever `block_on`s the
+/// runtime (a zapi promise is driven by the event loop's own polling job), and a
+/// `current_thread` runtime only polls its scheduler while some thread is inside
+/// `block_on`/`enter` — spawned tasks would never start.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
