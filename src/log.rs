@@ -147,8 +147,11 @@ pub(crate) fn js_page_on_log<'a>(
                         || evt.method == "Runtime.consoleAPICalled")
                         && evt.session_id.as_deref() == Some(&session_ev) =>
                 {
-                    push_log(&buffer, to_console_message(&evt.params));
-                    if tx.send(evt.params).is_err() {
+                    // One shape for the callback and the ring: `to_console_message`
+                    // flattens both CDP events, so `message.text` works either way.
+                    let message = to_console_message(&evt.params);
+                    push_log(&buffer, message.clone());
+                    if tx.send(message).is_err() {
                         break;
                     }
                 }

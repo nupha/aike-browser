@@ -5,3 +5,5 @@
 !types/**/*.d.ts
 !tests/
 !tests/**/*.mjs
+!README.md
+!NOTICE.txt

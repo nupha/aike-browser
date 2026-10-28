@@ -90,6 +90,21 @@ declare module "browser" {
     browserContextId?: string;
   }
 
+  /** Browser window geometry and state (`Browser.Bounds`). */
+  interface WindowBounds {
+    left?: number;
+    top?: number;
+    width?: number;
+    height?: number;
+    /**
+     * One of `"normal"`, `"minimized"`, `"maximized"`, `"fullscreen"`.
+     * Anything else throws a RangeError (Chrome aborts the browser process
+     * on an unknown state). A state other than `"normal"` cannot be combined
+     * with geometry in the same call.
+     */
+    windowState?: "normal" | "minimized" | "maximized" | "fullscreen";
+  }
+
   /** A Chrome browser instance. Cannot be constructed directly. */
   interface Browser {
     // ---- Target domain ----
@@ -124,22 +139,11 @@ declare module "browser" {
       jsVersion: string;
     }>;
 
-    /** Current browser window bounds. */
-    getWindowBounds(): Promise<any>;
+    /** Current window bounds, wrapped as `Browser.getWindowBounds` answers. */
+    getWindowBounds(): Promise<{ bounds: WindowBounds }>;
 
-    /** Set the browser window bounds `{ left?, top?, width?, height?, windowState? }`. */
-    setWindowBounds(bounds: {
-      left?: number;
-      top?: number;
-      width?: number;
-      height?: number;
-      /**
-       * One of `"normal"`, `"minimized"`, `"maximized"`, `"fullscreen"`.
-       * Anything else throws a RangeError (Chrome aborts the browser process
-       * on an unknown state).
-       */
-      windowState?: "normal" | "minimized" | "maximized" | "fullscreen";
-    }): Promise<void>;
+    /** Set the browser window bounds (a partial update; omitted fields are unchanged). */
+    setWindowBounds(bounds: WindowBounds): Promise<void>;
 
     /** Set global download behavior. Empty path → "deny", otherwise "allow". */
     setDownloadBehavior(path: string): Promise<void>;
@@ -196,10 +200,15 @@ declare module "browser" {
 
     // ---- Navigation ----
     /**
-     * Navigate to a URL. Resolves when Chrome has committed the navigation.
+     * Navigate to a URL.
+     *
+     * Resolves once the browser accepted the navigation — this is not a
+     * load-event wait, so follow it with `waitForSelector` /
+     * `waitForNavigation` when the result matters.
      * @throws Rejects with `navigate failed: <errorText>` when the browser could
      *   not load the URL — `Page.navigate` answers successfully even for a dead
-     *   navigation and puts the reason in `errorText`.
+     *   navigation and puts the reason in `errorText`. A navigation that turned
+     *   into a download is rejected too.
      */
     navigate(url: string): Promise<void>;
 
@@ -305,7 +314,10 @@ declare module "browser" {
       cssContentSize: { x: number; y: number; width: number; height: number };
     }>;
 
-    /** Inject a script that runs in every new document (before other scripts). */
+    /**
+     * Inject a script that runs in every new document (before other scripts).
+     * @returns The script identifier Chrome assigned.
+     */
     addInitScript(source: string): Promise<string>;
 
     /** Get the iframe/frame hierarchy tree. */
@@ -361,7 +373,10 @@ declare module "browser" {
     printToPDF(options?: PdfOptions): Promise<Uint8Array>;
 
     // ---- Viewport / emulation ----
-    /** Set the browser window / device viewport size. */
+    /**
+     * Override the device viewport size (CSS px). Sets `deviceScaleFactor: 1`
+     * and `mobile: false`; it does not resize the browser window.
+     */
     setViewport(width: number, height: number): Promise<void>;
 
     /** Override geolocation. */
@@ -412,7 +427,11 @@ declare module "browser" {
     close(): Promise<void>;
 
     // ---- DOM ----
-    /** Resolve a selector to a DOM nodeId (number), or 0 if not found. */
+    /**
+     * Resolve a selector to a DOM nodeId (number).
+     * @throws Rejects with `selector not found: <selector>` when nothing matches;
+     *   it never resolves to `0`.
+     */
     querySelector(selector: string): Promise<number>;
 
     /** Resolve a selector to an array of DOM nodeIds (numbers). */
@@ -424,8 +443,12 @@ declare module "browser" {
     /** Focus the first element matching the selector. */
     focus(selector: string): Promise<void>;
 
-    /** Get the box model (quads) of the first element matching the selector. */
-    getBoxModel(selector: string): Promise<any>;
+    /**
+     * Get the box model (quads) of the first element matching the selector.
+     * Resolves to the CDP `DOM.BoxModel` (`model`); rejects when the element is
+     * not found or has no layout box.
+     */
+    getBoxModel(selector: string): Promise<BoxModel>;
 
     /** Remove the first element matching the selector. */
     remove(selector: string): Promise<void>;
@@ -532,26 +555,12 @@ declare module "browser" {
 
     /**
      * Abort a paused request by its interceptionId.
-     * @param reason - A `Network.ErrorReason` value; anything else throws a
-     *   RangeError.
+     * @param reason - A `Network.ErrorReason` value, or `{ reason }`. Anything
+     *   else throws a RangeError.
      */
     abortRequest(
       interceptionId: string,
-      reason?:
-        | "Failed"
-        | "Aborted"
-        | "TimedOut"
-        | "AccessDenied"
-        | "ConnectionClosed"
-        | "ConnectionReset"
-        | "ConnectionRefused"
-        | "ConnectionAborted"
-        | "ConnectionFailed"
-        | "NameNotResolved"
-        | "InternetDisconnected"
-        | "AddressUnreachable"
-        | "BlockedByClient"
-        | "BlockedByResponse",
+      reason?: ErrorReason | { reason?: ErrorReason },
     ): Promise<void>;
 
     /**
@@ -572,7 +581,11 @@ declare module "browser" {
     onRequestPaused(callback: (event: any) => void): void;
 
     // ---- Network ----
-    /** Get all cookies for the current page. */
+    /**
+     * Get cookies as `Storage.getCookies` reports them.
+     *
+     * This is the browser's cookie jar, not just the current document's origin.
+     */
     getCookies(): Promise<Cookie[]>;
 
     /** Set a single cookie for the current page. */
@@ -704,6 +717,37 @@ declare module "browser" {
   // Supporting types
   // =========================================================================
 
+  /** `Network.ErrorReason` values `abortRequest` accepts. */
+  type ErrorReason =
+    | "Failed"
+    | "Aborted"
+    | "TimedOut"
+    | "AccessDenied"
+    | "ConnectionClosed"
+    | "ConnectionReset"
+    | "ConnectionRefused"
+    | "ConnectionAborted"
+    | "ConnectionFailed"
+    | "NameNotResolved"
+    | "InternetDisconnected"
+    | "AddressUnreachable"
+    | "BlockedByClient"
+    | "BlockedByResponse";
+
+  /**
+   * A CDP `DOM.BoxModel`, as `getBoxModel` returns it. Every quad is eight
+   * numbers: the four corners in `x, y` order (content, padding, border,
+   * margin boxes). `width` and `height` are the border-box size in CSS px.
+   */
+  interface BoxModel {
+    content: number[];
+    padding: number[];
+    border: number[];
+    margin: number[];
+    width: number;
+    height: number;
+  }
+
   /** Screenshot capture options. */
   interface ScreenshotOptions {
     /**
@@ -766,6 +810,7 @@ declare module "browser" {
   /** PDF export options. */
   interface PdfOptions {
     landscape?: boolean;
+    /** Paper size in inches (CDP defaults: 8.5 x 11). */
     paperWidth?: number;
     paperHeight?: number;
     /** Print background graphics. Default: true */
@@ -818,9 +863,12 @@ declare module "browser" {
    * `Runtime.consoleAPICalled` (`args[]`) are both flattened into `text`.
    */
   interface ConsoleMessage {
-    /** `"console-api"` for `console.*`, or the CDP `Log.Entry.source`. */
+    /**
+     * The console method (`"log"`, `"warning"`, ...) for `console.*`, or the
+     * CDP `Log.Entry.source`.
+     */
     source?: string;
-    /** CDP level (`"info"`, `"warning"`, `"error"`, ...) or the console method. */
+    /** The console method, or the CDP `Log.Entry.level`. */
     level?: string;
     /** The message text; console arguments joined with a space. */
     text?: string;

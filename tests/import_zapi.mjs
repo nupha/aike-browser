@@ -198,6 +198,12 @@ async function testLog(page) {
     fired && typeof entry === "object",
     "entry=" + JSON.stringify(entry),
   );
+  check(
+    "onLog entry has the flattened ConsoleMessage fields",
+    fired && typeof entry.text === "string" && typeof entry.source === "string" &&
+      typeof entry.level === "string",
+    "text=" + JSON.stringify(entry && entry.text),
+  );
 
   // getConsoleMessages() returns buffered entries (buffer kept).
   const msgs = await page.getConsoleMessages();

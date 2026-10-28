@@ -2,6 +2,14 @@
 name = "aike_browser"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "CDP-driven Chrome automation as a zapi native extension for the aike runtime"
+authors = ["John Ray <996351336@qq.com>"]
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["chrome", "cdp", "automation", "aike"]
+categories = ["development-tools::testing", "web-programming", "api-bindings"]
+repository = "https://github.com/nupha/aike-browser"
 
 [lib]
 name = "browser"
